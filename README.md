@@ -18,13 +18,27 @@ A comprehensive toolkit for merging fine-tuned language models using three diffe
 
 ## 📦 Installation
 
+### Local Installation
+
 ```bash
 # Clone repository
-git clone https://github.com/yourusername/Model-Merging.git
-cd Model-Merging
+git clone https://github.com/Shahriar-Ferdoush/test-2.git
+cd test-2
 
 # Install dependencies
-pip install torch transformers datasets peft accelerate
+pip install -r requirements.txt
+```
+
+### Kaggle Setup
+
+See **[KAGGLE_GUIDE.md](KAGGLE_GUIDE.md)** for complete Kaggle setup instructions.
+
+Quick start on Kaggle:
+
+```python
+!git clone https://github.com/Shahriar-Ferdoush/test-2.git
+%cd test-2
+!python kaggle_setup.py
 ```
 
 ## 🚀 Quick Start

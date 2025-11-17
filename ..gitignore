@@ -1,0 +1,76 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Model files and caches
+merge_cache/
+merged_models/
+*.pt
+*.bin
+*.safetensors
+*.ckpt
+*.pth
+
+# HuggingFace cache
+.cache/
+transformers_cache/
+
+# Data files
+*.csv
+*.json
+*.txt
+data/
+datasets/
+
+# OS files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# IDE
+.vscode/
+.idea/
+*.code-workspace
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Large files
+*.zip
+*.tar.gz
+*.tar
+*.gz
+
+# Outputs
+outputs/
+output/
+results/
+
+# Keep these
+!requirements.txt
+!README.md
+!LICENSE
+!.gitignore
