@@ -407,34 +407,66 @@ class LLaMAMerger:
             self._base_model_cache = AutoModelForCausalLM.from_pretrained(
                 self.base_model_path, torch_dtype=torch.float16, device_map="cpu"
             )
+            self._model_device = torch.device("cpu")  # Track device
 
         # Load ft models if not cached (MAJOR OPTIMIZATION!)
         if not hasattr(self, "_ft_models_cache"):
             log_print("  Loading fine-tuned models (cached for all layers)...")
             self._ft_models_cache = []
+
+            # Try GPU first for maximum speed
             device_to_use = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            all_models_loaded = []
 
-            for idx, ft_path in enumerate(self.finetuned_model_paths):
-                ft_model = self._load_lora_merged_model(ft_path)
-
-                # Try GPU first, fallback to CPU if OOM
+            # Try loading all models (base + ft) on GPU
+            if device_to_use.type == "cuda":
+                log_print(
+                    f"  Attempting to load all models on GPU for maximum speed..."
+                )
                 try:
-                    ft_model = ft_model.to(device_to_use)
+                    # Try moving base to GPU first
+                    test_base = self._base_model_cache.to(device_to_use)
+
+                    # Try loading ft models
+                    for idx, ft_path in enumerate(self.finetuned_model_paths):
+                        ft_model = self._load_lora_merged_model(ft_path)
+                        ft_model = ft_model.to(device_to_use)
+                        all_models_loaded.append(ft_model)
+
+                    # Success! All models fit on GPU
+                    self._base_model_cache = test_base
+                    self._model_device = device_to_use
+                    self._ft_models_cache = all_models_loaded
+                    log_print(f"  ✓ All models loaded on GPU for fastest processing!")
+
+                    for idx in range(len(self._ft_models_cache)):
+                        log_print(
+                            f"    ✓ Model {idx+1}/{len(self.finetuned_model_paths)} on cuda"
+                        )
+
                 except RuntimeError as e:
                     if "out of memory" in str(e).lower() or "cuda" in str(e).lower():
                         log_print(
-                            f"    ⚠ GPU memory exceeded for model {idx+1}, using CPU"
+                            f"    ⚠ Cannot fit all models on GPU, falling back to CPU"
                         )
                         torch.cuda.empty_cache()
                         device_to_use = torch.device("cpu")
-                        ft_model = ft_model.to(device_to_use)
+                        all_models_loaded = []
+                        # Base model is still on CPU from initial load
                     else:
                         raise
 
-                self._ft_models_cache.append(ft_model)
-                log_print(
-                    f"    ✓ Loaded ft model {idx+1}/{len(self.finetuned_model_paths)} on {device_to_use}"
-                )
+            # If GPU failed or not available, load on CPU
+            if not self._ft_models_cache:
+                log_print(f"  Loading models on CPU...")
+                for idx, ft_path in enumerate(self.finetuned_model_paths):
+                    ft_model = self._load_lora_merged_model(ft_path)
+                    ft_model = ft_model.to(torch.device("cpu"))
+                    self._ft_models_cache.append(ft_model)
+                    log_print(
+                        f"    ✓ Loaded ft model {idx+1}/{len(self.finetuned_model_paths)} on cpu"
+                    )
+                self._model_device = torch.device("cpu")
 
         # Get base layer parameters
         base_params = self._get_layer_params(self._base_model_cache, layer_name)
@@ -445,7 +477,8 @@ class LLaMAMerger:
             ft_params = self._get_layer_params(ft_model, layer_name)
 
             # Compute task vector: τ = θ_ft - θ_base
-            task_vector = ft_params - base_params
+            # Ensure both are on same device
+            task_vector = ft_params.to(base_params.device) - base_params
             task_vectors.append(task_vector)
 
         return task_vectors
@@ -1041,11 +1074,15 @@ class LLaMAMerger:
         return merged_model
 
     def _clear_base_model_cache(self):
-        """Clear cached base model to free memory."""
+        """Clear cached base and ft models to free memory."""
         if hasattr(self, "_base_model_cache"):
             del self._base_model_cache
-            gc.collect()
-            torch.cuda.empty_cache()
+        if hasattr(self, "_ft_models_cache"):
+            del self._ft_models_cache
+        if hasattr(self, "_model_device"):
+            del self._model_device
+        gc.collect()
+        torch.cuda.empty_cache()
 
     def merge_with_dare(self, use_sparsegpt: bool = False) -> AutoModelForCausalLM:
         """
