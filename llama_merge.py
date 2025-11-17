@@ -264,11 +264,11 @@ class LLaMAMerger:
     def compute_and_cache_importance_masks(self):
         """
         STORAGE-OPTIMIZED: Compute importance masks and cache only masks.
-        
+
         This saves ~98% storage compared to caching full Hessians:
         - Old: Save 6GB Hessian per model = 12GB total
         - New: Save 100MB mask per model = 200MB total
-        
+
         Process:
         1. Load model
         2. Compute Hessians (in memory only)
@@ -280,7 +280,7 @@ class LLaMAMerger:
         log_print("STEP 1: Computing Importance Masks (SparseGPT)")
         log_print("=" * 60)
         log_print("Note: Computing on-the-fly, caching only masks to save space")
-        
+
         # Load tokenizer once
         tokenizer = AutoTokenizer.from_pretrained(self.base_model_path)
         if tokenizer.pad_token is None:
@@ -307,9 +307,27 @@ class LLaMAMerger:
 
             # Load model
             log_print(f"  [2/4] Loading model...")
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             model = self._load_finetuned_model(ft_model_path, self.base_model_path)
-            model.eval()
-            model.to(self.device)
+
+            # Try GPU first, fallback to CPU if OOM
+            try:
+                model = model.to(device)
+                model.eval()
+                log_print(f"    ✓ Model loaded on {device}")
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower() or "cuda" in str(e).lower():
+                    log_print(f"    ⚠ GPU memory exceeded, falling back to CPU")
+                    torch.cuda.empty_cache()
+                    device = torch.device("cpu")
+                    model = model.to(device)
+                    model.eval()
+                    log_print(f"    ✓ Model loaded on {device}")
+                else:
+                    raise
+
+            # Store device for forward passes
+            self._current_device = device
 
             # Find all linear layers
             linear_layers = self._find_linear_layers(model)
@@ -322,32 +340,36 @@ class LLaMAMerger:
             )
 
             # Generate importance masks from Hessians
-            log_print(f"  [4/4] Generating importance masks (top {int(self.density*100)}% weights)...")
+            log_print(
+                f"  [4/4] Generating importance masks (top {int(self.density*100)}% weights)..."
+            )
             importance_masks = {}
             for layer_name, h_inv_diag in hessian_inv_diags.items():
                 # Get layer to compute importance scores
                 layer = linear_layers[layer_name]
                 weight = layer.weight.data.cpu()
-                
+
                 # Compute importance: |w|^2 * H^{-1}
                 importance = weight.pow(2) * h_inv_diag.unsqueeze(0)
-                
+
                 # Get top-k mask (sparse boolean)
                 k = int(importance.numel() * self.density)
                 threshold = torch.topk(importance.flatten(), k).values[-1]
                 mask = importance >= threshold
-                
+
                 # Store as sparse (saves memory)
                 importance_masks[layer_name] = mask.to_sparse()
-            
+
             log_print(f"  ✓ Generated masks for {len(importance_masks)} layers")
 
             # Save masks ONLY (not Hessians!)
             log_print(f"  Saving importance masks: {mask_file}")
             torch.save(importance_masks, mask_file)
-            
+
             # Calculate saved space
-            mask_size_mb = mask_file.stat().st_size / (1024**2) if mask_file.exists() else 0
+            mask_size_mb = (
+                mask_file.stat().st_size / (1024**2) if mask_file.exists() else 0
+            )
             log_print(f"  ✓ Saved {mask_size_mb:.1f}MB (vs ~6GB for full Hessian!)")
 
             # Free memory
@@ -358,7 +380,9 @@ class LLaMAMerger:
             log_print(f"  ✓ Model {idx+1}/{len(self.finetuned_model_paths)} complete!")
 
         log_print("\n✓ Importance mask computation complete!")
-        log_print(f"Total cache size: ~{len(self.finetuned_model_paths) * 100}MB (vs ~{len(self.finetuned_model_paths) * 6000}MB with full Hessians!)")
+        log_print(
+            f"Total cache size: ~{len(self.finetuned_model_paths) * 100}MB (vs ~{len(self.finetuned_model_paths) * 6000}MB with full Hessians!)"
+        )
 
     # ============================================================================
     # HELPER: On-the-fly Task Vector Computation
@@ -368,64 +392,87 @@ class LLaMAMerger:
         """
         Compute task vectors on-the-fly for a specific layer.
         This eliminates the need to cache 6GB task vector files!
-        
+
+        OPTIMIZATION: Cache ft models to avoid reloading for EVERY layer!
+
         Args:
             layer_name: Name of the layer (e.g., 'model.layers.0.mlp.gate_proj')
-            
+
         Returns:
             List of task vectors (one per fine-tuned model)
         """
         # Load base model if not cached
-        if not hasattr(self, '_base_model_cache'):
+        if not hasattr(self, "_base_model_cache"):
             log_print("  Loading base model (cached for all layers)...")
             self._base_model_cache = AutoModelForCausalLM.from_pretrained(
-                self.base_model_path, 
-                torch_dtype=torch.float16, 
-                device_map="cpu"
+                self.base_model_path, torch_dtype=torch.float16, device_map="cpu"
             )
-        
+
+        # Load ft models if not cached (MAJOR OPTIMIZATION!)
+        if not hasattr(self, "_ft_models_cache"):
+            log_print("  Loading fine-tuned models (cached for all layers)...")
+            self._ft_models_cache = []
+            device_to_use = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+            for idx, ft_path in enumerate(self.finetuned_model_paths):
+                ft_model = self._load_lora_merged_model(ft_path)
+
+                # Try GPU first, fallback to CPU if OOM
+                try:
+                    ft_model = ft_model.to(device_to_use)
+                except RuntimeError as e:
+                    if "out of memory" in str(e).lower() or "cuda" in str(e).lower():
+                        log_print(
+                            f"    ⚠ GPU memory exceeded for model {idx+1}, using CPU"
+                        )
+                        torch.cuda.empty_cache()
+                        device_to_use = torch.device("cpu")
+                        ft_model = ft_model.to(device_to_use)
+                    else:
+                        raise
+
+                self._ft_models_cache.append(ft_model)
+                log_print(
+                    f"    ✓ Loaded ft model {idx+1}/{len(self.finetuned_model_paths)} on {device_to_use}"
+                )
+
         # Get base layer parameters
         base_params = self._get_layer_params(self._base_model_cache, layer_name)
-        
+
         # Compute task vector for each fine-tuned model
         task_vectors = []
-        for idx, ft_path in enumerate(self.finetuned_model_paths):
-            # Load fine-tuned model (just this layer's parameters)
-            ft_model = self._load_lora_merged_model(ft_path, layer_name)
+        for ft_model in self._ft_models_cache:
             ft_params = self._get_layer_params(ft_model, layer_name)
-            
+
             # Compute task vector: τ = θ_ft - θ_base
             task_vector = ft_params - base_params
             task_vectors.append(task_vector)
-            
-            # Free memory
-            del ft_model
-        
+
         return task_vectors
 
-    def _load_lora_merged_model(self, lora_path: str, layer_name: str = None) -> AutoModelForCausalLM:
+    def _load_lora_merged_model(
+        self, lora_path: str, layer_name: str = None
+    ) -> AutoModelForCausalLM:
         """
         Load LoRA adapter and merge with base model.
         Optimized to only load needed layers if layer_name specified.
-        
+
         Args:
             lora_path: Path to LoRA adapter
             layer_name: Optional layer name for selective loading
-            
+
         Returns:
             Model with LoRA merged
         """
         # Load base model
         base_model = AutoModelForCausalLM.from_pretrained(
-            self.base_model_path,
-            torch_dtype=torch.float16,
-            device_map="cpu"
+            self.base_model_path, torch_dtype=torch.float16, device_map="cpu"
         )
-        
+
         # Load and merge LoRA
         model = PeftModel.from_pretrained(base_model, lora_path)
         merged_model = model.merge_and_unload()
-        
+
         return merged_model
 
     # ============================================================================
@@ -787,6 +834,7 @@ class LLaMAMerger:
             f"    Running {len(calibration_data)} samples through model to capture activations..."
         )
         start_time = time.time()
+        forward_device = getattr(self, "_current_device", self.device)
         with torch.no_grad():
             for i, batch in enumerate(calibration_data):
                 if (i + 1) % 10 == 0:
@@ -797,9 +845,28 @@ class LLaMAMerger:
                         f"      Progress: {i+1}/{len(calibration_data)} samples | Rate: {rate:.1f} samples/s | ETA: {eta:.0f}s"
                     )
 
-                batch = batch.to(self.device)
                 try:
+                    batch = batch.to(forward_device)
                     _ = model(batch)
+                except RuntimeError as e:
+                    if "out of memory" in str(e).lower() or "cuda" in str(e).lower():
+                        log_print(
+                            f"      ⚠ GPU OOM on batch {i+1}, falling back to CPU"
+                        )
+                        torch.cuda.empty_cache()
+                        forward_device = torch.device("cpu")
+                        model = model.to(forward_device)
+                        batch = batch.to(forward_device)
+                        try:
+                            _ = model(batch)
+                        except Exception as e2:
+                            logger.warning(
+                                f"      Error on batch {i} (CPU fallback): {e2}"
+                            )
+                            continue
+                    else:
+                        logger.warning(f"      Error on batch {i}: {e}")
+                        continue
                 except Exception as e:
                     logger.warning(f"      Error on batch {i}: {e}")
                     continue
@@ -901,34 +968,67 @@ class LLaMAMerger:
                     if full_key:
                         # Convert sparse mask back to dense
                         sparse_mask = mask_dict[full_key]
-                        dense_mask = sparse_mask.to_dense() if sparse_mask.is_sparse else sparse_mask
+                        dense_mask = (
+                            sparse_mask.to_dense()
+                            if sparse_mask.is_sparse
+                            else sparse_mask
+                        )
                         importance_masks.append(dense_mask)
                     else:
                         logger.warning(
                             f"    Mask for {layer_name} not found in model {idx}"
                         )
                         # Create dummy mask (all True)
-                        importance_masks.append(torch.ones(base_params.numel(), dtype=torch.bool))
-                
+                        importance_masks.append(
+                            torch.ones(base_params.numel(), dtype=torch.bool)
+                        )
+
                 # Apply masks directly to task vectors (bypass importance computation)
                 for i, mask in enumerate(importance_masks):
-                    task_vectors[i] = task_vectors[i] * mask.reshape(task_vectors[i].shape)
+                    task_vectors[i] = task_vectors[i] * mask.reshape(
+                        task_vectors[i].shape
+                    )
 
             # Merge this layer
-            # Note: When use_sparsegpt=True, we've already applied masks, 
+            # Note: When use_sparsegpt=True, we've already applied masks,
             # so we pass use_sparsegpt=False to merger to skip redundant computation
             try:
-                merged_params = merger.merge(
-                    weights=[1.0] * len(task_vectors),
-                    base_model_parameters=base_params,
-                    ft_models_parameters=[base_params + tv for tv in task_vectors],
-                    densities=[self.density] * len(task_vectors),
-                    device=torch.device("cpu"),
-                    hessian_inv_diags=None,  # Not needed - masks already applied
-                    use_sparsegpt=False,  # We've pre-applied masks above
-                )
+                # Use GPU if available for faster merging
+                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-                # Update merged model
+                try:
+                    merged_params = merger.merge(
+                        weights=[1.0] * len(task_vectors),
+                        base_model_parameters=base_params,
+                        ft_models_parameters=[base_params + tv for tv in task_vectors],
+                        densities=[self.density] * len(task_vectors),
+                        device=device,
+                        hessian_inv_diags=None,  # Not needed - masks already applied
+                        use_sparsegpt=False,  # We've pre-applied masks above
+                    )
+                except RuntimeError as e:
+                    if "out of memory" in str(e).lower() or "cuda" in str(e).lower():
+                        if device.type == "cuda":
+                            log_print(
+                                f"      ⚠ GPU OOM on layer {layer_name}, using CPU"
+                            )
+                            torch.cuda.empty_cache()
+                            device = torch.device("cpu")
+                            merged_params = merger.merge(
+                                weights=[1.0] * len(task_vectors),
+                                base_model_parameters=base_params,
+                                ft_models_parameters=[
+                                    base_params + tv for tv in task_vectors
+                                ],
+                                densities=[self.density] * len(task_vectors),
+                                device=device,
+                                hessian_inv_diags=None,
+                                use_sparsegpt=False,
+                            )
+                        else:
+                            raise
+                    else:
+                        raise  # Update merged model
                 self._set_layer_params(merged_model, layer_name, merged_params)
             except Exception as e:
                 logger.error(f"    Error merging {layer_name}: {e}")
@@ -936,13 +1036,13 @@ class LLaMAMerger:
 
         # Cleanup base model cache
         self._clear_base_model_cache()
-        
+
         log_print(f"\n✓ {method_name} merge complete!")
         return merged_model
 
     def _clear_base_model_cache(self):
         """Clear cached base model to free memory."""
-        if hasattr(self, '_base_model_cache'):
+        if hasattr(self, "_base_model_cache"):
             del self._base_model_cache
             gc.collect()
             torch.cuda.empty_cache()
@@ -1007,27 +1107,62 @@ class LLaMAMerger:
                     if full_key:
                         # Convert sparse mask back to dense
                         sparse_mask = mask_dict[full_key]
-                        dense_mask = sparse_mask.to_dense() if sparse_mask.is_sparse else sparse_mask
+                        dense_mask = (
+                            sparse_mask.to_dense()
+                            if sparse_mask.is_sparse
+                            else sparse_mask
+                        )
                         importance_masks.append(dense_mask)
                     else:
-                        importance_masks.append(torch.ones(base_params.numel(), dtype=torch.bool))
-                
+                        importance_masks.append(
+                            torch.ones(base_params.numel(), dtype=torch.bool)
+                        )
+
                 # Apply masks directly to task vectors
                 for i, mask in enumerate(importance_masks):
-                    task_vectors[i] = task_vectors[i] * mask.reshape(task_vectors[i].shape)
+                    task_vectors[i] = task_vectors[i] * mask.reshape(
+                        task_vectors[i].shape
+                    )
 
             # Merge this layer
             # Note: When use_sparsegpt=True, we've already applied masks
             try:
-                merged_params = merger.merge(
-                    weights=[1.0] * len(task_vectors),
-                    base_model_parameters=base_params,
-                    ft_models_parameters=[base_params + tv for tv in task_vectors],
-                    densities=[self.density] * len(task_vectors),
-                    device=torch.device("cpu"),
-                    hessian_inv_diags=None,  # Not needed - masks already applied
-                    use_sparsegpt=False,  # We've pre-applied masks above
-                )
+                # Use GPU if available for faster merging
+                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+                try:
+                    merged_params = merger.merge(
+                        weights=[1.0] * len(task_vectors),
+                        base_model_parameters=base_params,
+                        ft_models_parameters=[base_params + tv for tv in task_vectors],
+                        densities=[self.density] * len(task_vectors),
+                        device=device,
+                        hessian_inv_diags=None,  # Not needed - masks already applied
+                        use_sparsegpt=False,  # We've pre-applied masks above
+                    )
+                except RuntimeError as e:
+                    if "out of memory" in str(e).lower() or "cuda" in str(e).lower():
+                        if device.type == "cuda":
+                            log_print(
+                                f"      ⚠ GPU OOM on layer {layer_name}, using CPU"
+                            )
+                            torch.cuda.empty_cache()
+                            device = torch.device("cpu")
+                            merged_params = merger.merge(
+                                weights=[1.0] * len(task_vectors),
+                                base_model_parameters=base_params,
+                                ft_models_parameters=[
+                                    base_params + tv for tv in task_vectors
+                                ],
+                                densities=[self.density] * len(task_vectors),
+                                device=device,
+                                hessian_inv_diags=None,
+                                use_sparsegpt=False,
+                            )
+                        else:
+                            raise
+                    else:
+                        raise
 
                 # Update merged model
                 self._set_layer_params(merged_model, layer_name, merged_params)
@@ -1037,7 +1172,7 @@ class LLaMAMerger:
 
         # Cleanup base model cache
         self._clear_base_model_cache()
-        
+
         log_print(f"\n✓ {method_name} merge complete!")
         return merged_model
 
@@ -1179,12 +1314,12 @@ class LLaMAMerger:
     def merge_all_methods(self) -> Dict[str, Dict]:
         """
         STORAGE-OPTIMIZED: Run all three merging methods and compare results.
-        
+
         New approach:
         - Task vectors computed on-the-fly (no storage)
         - Only importance masks cached (~100MB each)
         - Total cache: ~200MB vs old ~24GB
-        
+
         Returns:
             Dictionary with results for each method
         """
