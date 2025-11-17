@@ -481,7 +481,7 @@ class LLaMAMerger:
             task_vector = ft_params.to(base_params.device) - base_params
             task_vectors.append(task_vector)
 
-        return task_vectors
+        return task_vectors, self._model_device, base_params.device
 
     def _load_lora_merged_model(
         self, lora_path: str, layer_name: str = None
@@ -988,7 +988,7 @@ class LLaMAMerger:
             base_params = self._get_layer_params(merged_model, layer_name)
 
             # Compute task vectors on-the-fly (NO STORAGE!)
-            task_vectors = self._compute_task_vectors_for_layer(layer_name)
+            task_vectors, model_device = self._compute_task_vectors_for_layer(layer_name)
 
             # Load importance masks if using SparseGPT
             importance_masks = None
@@ -999,21 +999,21 @@ class LLaMAMerger:
                     mask_dict = torch.load(mask_file, map_location="cpu")
                     full_key = self._find_matching_key(mask_dict, layer_name)
                     if full_key:
-                        # Convert sparse mask back to dense
+                        # Convert sparse mask back to dense and move to model device
                         sparse_mask = mask_dict[full_key]
                         dense_mask = (
                             sparse_mask.to_dense()
                             if sparse_mask.is_sparse
                             else sparse_mask
                         )
-                        importance_masks.append(dense_mask)
+                        importance_masks.append(dense_mask.to(model_device))
                     else:
                         logger.warning(
                             f"    Mask for {layer_name} not found in model {idx}"
                         )
-                        # Create dummy mask (all True)
+                        # Create dummy mask (all True) on correct device
                         importance_masks.append(
-                            torch.ones(base_params.numel(), dtype=torch.bool)
+                            torch.ones(base_params.numel(), dtype=torch.bool, device=model_device)
                         )
 
                 # Apply masks directly to task vectors (bypass importance computation)
@@ -1026,8 +1026,8 @@ class LLaMAMerger:
             # Note: When use_sparsegpt=True, we've already applied masks,
             # so we pass use_sparsegpt=False to merger to skip redundant computation
             try:
-                # Use GPU if available for faster merging
-                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                # Use same device as models for consistency
+                merge_device = model_device
 
                 try:
                     merged_params = merger.merge(
@@ -1035,26 +1035,29 @@ class LLaMAMerger:
                         base_model_parameters=base_params,
                         ft_models_parameters=[base_params + tv for tv in task_vectors],
                         densities=[self.density] * len(task_vectors),
-                        device=device,
+                        device=merge_device,
                         hessian_inv_diags=None,  # Not needed - masks already applied
                         use_sparsegpt=False,  # We've pre-applied masks above
                     )
                 except RuntimeError as e:
                     if "out of memory" in str(e).lower() or "cuda" in str(e).lower():
-                        if device.type == "cuda":
+                        if merge_device.type == "cuda":
                             log_print(
-                                f"      ⚠ GPU OOM on layer {layer_name}, using CPU"
+                                f"      ⚠ GPU OOM on layer {layer_name}, moving to CPU"
                             )
                             torch.cuda.empty_cache()
-                            device = torch.device("cpu")
+                            merge_device = torch.device("cpu")
+                            # Move all tensors to CPU
+                            base_params_cpu = base_params.to("cpu")
+                            task_vectors_cpu = [tv.to("cpu") for tv in task_vectors]
                             merged_params = merger.merge(
-                                weights=[1.0] * len(task_vectors),
-                                base_model_parameters=base_params,
+                                weights=[1.0] * len(task_vectors_cpu),
+                                base_model_parameters=base_params_cpu,
                                 ft_models_parameters=[
-                                    base_params + tv for tv in task_vectors
+                                    base_params_cpu + tv for tv in task_vectors_cpu
                                 ],
-                                densities=[self.density] * len(task_vectors),
-                                device=device,
+                                densities=[self.density] * len(task_vectors_cpu),
+                                device=merge_device,
                                 hessian_inv_diags=None,
                                 use_sparsegpt=False,
                             )
@@ -1131,7 +1134,7 @@ class LLaMAMerger:
             base_params = self._get_layer_params(merged_model, layer_name)
 
             # Compute task vectors on-the-fly (NO STORAGE!)
-            task_vectors = self._compute_task_vectors_for_layer(layer_name)
+            task_vectors, model_device = self._compute_task_vectors_for_layer(layer_name)
 
             # Load importance masks if using SparseGPT
             importance_masks = None
@@ -1142,17 +1145,17 @@ class LLaMAMerger:
                     mask_dict = torch.load(mask_file, map_location="cpu")
                     full_key = self._find_matching_key(mask_dict, layer_name)
                     if full_key:
-                        # Convert sparse mask back to dense
+                        # Convert sparse mask back to dense and move to model device
                         sparse_mask = mask_dict[full_key]
                         dense_mask = (
                             sparse_mask.to_dense()
                             if sparse_mask.is_sparse
                             else sparse_mask
                         )
-                        importance_masks.append(dense_mask)
+                        importance_masks.append(dense_mask.to(model_device))
                     else:
                         importance_masks.append(
-                            torch.ones(base_params.numel(), dtype=torch.bool)
+                            torch.ones(base_params.numel(), dtype=torch.bool, device=model_device)
                         )
 
                 # Apply masks directly to task vectors
@@ -1164,8 +1167,8 @@ class LLaMAMerger:
             # Merge this layer
             # Note: When use_sparsegpt=True, we've already applied masks
             try:
-                # Use GPU if available for faster merging
-                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                # Use same device as models for consistency
+                merge_device = model_device
 
                 try:
                     merged_params = merger.merge(
@@ -1173,26 +1176,29 @@ class LLaMAMerger:
                         base_model_parameters=base_params,
                         ft_models_parameters=[base_params + tv for tv in task_vectors],
                         densities=[self.density] * len(task_vectors),
-                        device=device,
+                        device=merge_device,
                         hessian_inv_diags=None,  # Not needed - masks already applied
                         use_sparsegpt=False,  # We've pre-applied masks above
                     )
                 except RuntimeError as e:
                     if "out of memory" in str(e).lower() or "cuda" in str(e).lower():
-                        if device.type == "cuda":
+                        if merge_device.type == "cuda":
                             log_print(
-                                f"      ⚠ GPU OOM on layer {layer_name}, using CPU"
+                                f"      ⚠ GPU OOM on layer {layer_name}, moving to CPU"
                             )
                             torch.cuda.empty_cache()
-                            device = torch.device("cpu")
+                            merge_device = torch.device("cpu")
+                            # Move all tensors to CPU
+                            base_params_cpu = base_params.to("cpu")
+                            task_vectors_cpu = [tv.to("cpu") for tv in task_vectors]
                             merged_params = merger.merge(
-                                weights=[1.0] * len(task_vectors),
-                                base_model_parameters=base_params,
+                                weights=[1.0] * len(task_vectors_cpu),
+                                base_model_parameters=base_params_cpu,
                                 ft_models_parameters=[
-                                    base_params + tv for tv in task_vectors
+                                    base_params_cpu + tv for tv in task_vectors_cpu
                                 ],
-                                densities=[self.density] * len(task_vectors),
-                                device=device,
+                                densities=[self.density] * len(task_vectors_cpu),
+                                device=merge_device,
                                 hessian_inv_diags=None,
                                 use_sparsegpt=False,
                             )
