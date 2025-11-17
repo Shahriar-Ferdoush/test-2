@@ -60,6 +60,18 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+# Helper function for Kaggle-visible output
+def log_print(msg, level="INFO"):
+    """Print to stdout (visible in Kaggle) and log"""
+    print(msg, flush=True)  # flush=True ensures immediate output in Kaggle
+    if level == "INFO":
+        logger.info(msg)
+    elif level == "WARNING":
+        logger.warning(msg)
+    elif level == "ERROR":
+        logger.error(msg)
+
+
 class LLaMAMerger:
     """
     Memory-efficient LLaMA model merger with three methods:
@@ -147,16 +159,22 @@ class LLaMAMerger:
         logger.info(f"Loading calibration data from {dataset_name}...")
 
         try:
-            # Load dataset
-            dataset = load_dataset(dataset_name, split="train")
+            # Load dataset - only first N samples to avoid downloading entire dataset
+            log_print(f"  Loading dataset split (first {self.num_calibration_samples} samples)...")
+            dataset = load_dataset(dataset_name, split=f"train[:{self.num_calibration_samples}]")
+            log_print(f"  ✓ Dataset loaded: {len(dataset)} samples")
 
             # Get text field (common names: 'text', 'content', 'conversation', etc.)
             text_field = self._detect_text_field(dataset)
+            logger.info(f"  Using text field: '{text_field}'")
 
             calibration_data = []
 
             # Process samples
+            log_print(f"  Tokenizing samples...")
             for i in range(min(self.num_calibration_samples, len(dataset))):
+                if (i + 1) % 20 == 0:
+                    log_print(f"    Progress: {i+1}/{min(self.num_calibration_samples, len(dataset))} samples tokenized")
                 try:
                     text = dataset[i][text_field]
 
@@ -176,10 +194,10 @@ class LLaMAMerger:
                     calibration_data.append(tokens["input_ids"])
 
                 except Exception as e:
-                    logger.warning(f"Skipping sample {i}: {e}")
+                    logger.warning(f"    Skipping sample {i}: {e}")
                     continue
 
-            logger.info(f"Loaded {len(calibration_data)} calibration samples")
+            log_print(f"  ✓ Loaded {len(calibration_data)} calibration samples")
             return calibration_data
 
         except Exception as e:
@@ -232,12 +250,12 @@ class LLaMAMerger:
            d. Unload fine-tuned model
         3. Unload base model
         """
-        logger.info("=" * 60)
-        logger.info("STEP 1: Computing Task Vectors")
-        logger.info("=" * 60)
+        log_print("=" * 60)
+        log_print("STEP 1: Computing Task Vectors")
+        log_print("=" * 60)
 
         # Load base model ONCE
-        logger.info(f"Loading base model: {self.base_model_path}")
+        log_print(f"Loading base model: {self.base_model_path}")
         base_model = AutoModelForCausalLM.from_pretrained(
             self.base_model_path,
             torch_dtype=torch.float16,
@@ -249,49 +267,61 @@ class LLaMAMerger:
 
         # Process each fine-tuned model
         for idx, ft_model_path in enumerate(self.finetuned_model_paths):
-            logger.info(
-                f"\n[{idx+1}/{len(self.finetuned_model_paths)}] Processing {ft_model_path}"
+            log_print(
+                f"\n{'='*60}\n[{idx+1}/{len(self.finetuned_model_paths)}] Processing: {ft_model_path}\n{'='*60}"
             )
 
             # Check if already cached
             task_vector_file = self.task_vector_dir / f"task_vector_{idx}.pt"
             if task_vector_file.exists():
-                logger.info(f"  Task vector already computed: {task_vector_file}")
+                log_print(f"  ✓ Task vector already cached: {task_vector_file}")
+                log_print(f"  Skipping computation...")
                 continue
 
             # Load fine-tuned model
-            logger.info(f"  Loading fine-tuned model...")
+            log_print(f"  [1/4] Loading fine-tuned model...")
+            start_time = time.time()
             ft_model = self._load_finetuned_model(ft_model_path, self.base_model_path)
+            log_print(f"  ✓ Model loaded in {time.time()-start_time:.1f}s")
 
             # Get state dict
+            log_print(f"  [2/4] Extracting state dict...")
             ft_state_dict = ft_model.state_dict()
+            log_print(f"  ✓ Found {len(ft_state_dict)} parameters")
 
             # Compute task vectors: τ = θ_ft - θ_base
-            logger.info(f"  Computing task vectors...")
+            log_print(f"  [3/4] Computing task vectors...")
             task_vectors = {}
-            for key in base_state_dict.keys():
+            num_keys = len(base_state_dict.keys())
+            for i, key in enumerate(base_state_dict.keys()):
+                if (i + 1) % 50 == 0:
+                    log_print(f"    Progress: {i+1}/{num_keys} layers processed")
                 if key in ft_state_dict:
                     # Task vector for this layer
                     task_vectors[key] = (
                         ft_state_dict[key].cpu().float()
                         - base_state_dict[key].cpu().float()
                     )
+            log_print(f"  ✓ Computed task vectors for {len(task_vectors)} layers")
 
             # Save to disk
-            logger.info(f"  Saving task vectors: {task_vector_file}")
+            log_print(f"  [4/4] Saving task vectors: {task_vector_file}")
             torch.save(task_vectors, task_vector_file)
+            log_print(f"  ✓ Saved to disk")
 
             # Free memory
+            log_print(f"  Cleaning up memory...")
             del ft_model, ft_state_dict
             gc.collect()
             torch.cuda.empty_cache()
+            log_print(f"  ✓ Model {idx+1}/{len(self.finetuned_model_paths)} complete!")
 
         # Free base model
         del base_model, base_state_dict
         gc.collect()
         torch.cuda.empty_cache()
 
-        logger.info("\n✓ Task vector computation complete!")
+        log_print("\n✓ Task vector computation complete!")
 
     def _load_finetuned_model(
         self, ft_model_path: str, base_model_path: str
@@ -459,9 +489,9 @@ class LLaMAMerger:
            d. Save Hessians to disk
            e. Unload model
         """
-        logger.info("=" * 60)
-        logger.info("STEP 2: Computing Hessians for SparseGPT")
-        logger.info("=" * 60)
+        log_print("=" * 60)
+        log_print("STEP 2: Computing Hessians for SparseGPT")
+        log_print("=" * 60)
 
         # Load tokenizer once
         tokenizer = AutoTokenizer.from_pretrained(self.base_model_path)
@@ -483,11 +513,11 @@ class LLaMAMerger:
                 continue
 
             # Load calibration data
-            logger.info(f"  Loading calibration data from {dataset_name}...")
+            log_print(f"  Loading calibration data from {dataset_name}...")
             calibration_data = self.load_calibration_data(dataset_name, tokenizer)
 
             # Load model
-            logger.info(f"  Loading model...")
+            log_print(f"  Loading model...")
             model = self._load_finetuned_model(ft_model_path, self.base_model_path)
             model.eval()
             model.to(self.device)
@@ -497,7 +527,7 @@ class LLaMAMerger:
             logger.info(f"  Found {len(linear_layers)} linear layers")
 
             # Compute Hessians
-            logger.info(f"  Computing Hessians...")
+            log_print(f"  Computing Hessians...")
             hessian_inv_diags = self._compute_hessians_for_model(
                 model, linear_layers, calibration_data
             )
@@ -511,7 +541,7 @@ class LLaMAMerger:
             gc.collect()
             torch.cuda.empty_cache()
 
-        logger.info("\n✓ Hessian computation complete!")
+        log_print("\n✓ Hessian computation complete!")
 
     def _find_linear_layers(self, model: nn.Module) -> Dict[str, nn.Linear]:
         """Find all Linear layers in the model."""
@@ -558,11 +588,15 @@ class LLaMAMerger:
             hooks.append(layer.register_forward_hook(get_activation_hook(name)))
 
         # Run calibration data through model
-        logger.info(f"    Running {len(calibration_data)} samples through model...")
+        log_print(f"    Running {len(calibration_data)} samples through model to capture activations...")
+        start_time = time.time()
         with torch.no_grad():
             for i, batch in enumerate(calibration_data):
-                if (i + 1) % 32 == 0:
-                    logger.info(f"      Processed {i+1}/{len(calibration_data)}")
+                if (i + 1) % 10 == 0:
+                    elapsed = time.time() - start_time
+                    rate = (i + 1) / elapsed
+                    eta = (len(calibration_data) - i - 1) / rate if rate > 0 else 0
+                    log_print(f"      Progress: {i+1}/{len(calibration_data)} samples | Rate: {rate:.1f} samples/s | ETA: {eta:.0f}s")
 
                 batch = batch.to(self.device)
                 try:
@@ -570,14 +604,19 @@ class LLaMAMerger:
                 except Exception as e:
                     logger.warning(f"      Error on batch {i}: {e}")
                     continue
+        log_print(f"    ✓ Forward pass complete in {time.time()-start_time:.1f}s")
 
         # Remove hooks
         for hook in hooks:
             hook.remove()
 
         # Compute Hessians from activations
-        logger.info(f"    Computing inverse Hessian diagonals...")
-        for name, layer in linear_layers.items():
+        log_print(f"    Computing inverse Hessian diagonals for {len(linear_layers)} layers...")
+        num_layers = len(linear_layers)
+        for layer_idx, (name, layer) in enumerate(linear_layers.items()):
+            if (layer_idx + 1) % 10 == 0 or layer_idx == 0:
+                log_print(f"      Layer {layer_idx+1}/{num_layers}: {name}")
+            
             if not activations[name]:
                 logger.warning(f"      No activations captured for {name}, skipping")
                 continue
@@ -594,7 +633,7 @@ class LLaMAMerger:
             h_inv_diag = calc.get_inverse_hessian_diag(percdamp=0.01)
             hessian_inv_diags[name] = h_inv_diag
 
-        logger.info(f"    Computed Hessians for {len(hessian_inv_diags)} layers")
+        log_print(f"    ✓ Computed Hessians for {len(hessian_inv_diags)} layers")
         return hessian_inv_diags
 
     # ============================================================================
@@ -633,9 +672,14 @@ class LLaMAMerger:
         merger = TIES()
 
         # Merge layer by layer
+        log_print(f"\nMerging {len(layer_names)} layers...")
+        merge_start = time.time()
         for layer_idx, layer_name in enumerate(layer_names):
-            if (layer_idx + 1) % 10 == 0:
-                logger.info(f"  [{layer_idx+1}/{len(layer_names)}] {layer_name}")
+            if (layer_idx + 1) % 10 == 0 or layer_idx == 0:
+                elapsed = time.time() - merge_start
+                rate = (layer_idx + 1) / elapsed if elapsed > 0 else 0
+                eta = (len(layer_names) - layer_idx - 1) / rate if rate > 0 else 0
+                log_print(f"  [{layer_idx+1}/{len(layer_names)}] {layer_name} | ETA: {eta:.0f}s")
 
             # Get base layer parameters
             base_params = self._get_layer_params(merged_model, layer_name)
@@ -691,7 +735,7 @@ class LLaMAMerger:
                 logger.error(f"    Error merging {layer_name}: {e}")
                 continue
 
-        logger.info(f"\n✓ {method_name} merge complete!")
+        log_print(f"\n✓ {method_name} merge complete!")
         return merged_model
 
     def merge_with_dare(self, use_sparsegpt: bool = False) -> AutoModelForCausalLM:
@@ -726,9 +770,14 @@ class LLaMAMerger:
         merger = DARE()
 
         # Merge layer by layer
+        log_print(f"\nMerging {len(layer_names)} layers...")
+        merge_start = time.time()
         for layer_idx, layer_name in enumerate(layer_names):
-            if (layer_idx + 1) % 10 == 0:
-                logger.info(f"  [{layer_idx+1}/{len(layer_names)}] {layer_name}")
+            if (layer_idx + 1) % 10 == 0 or layer_idx == 0:
+                elapsed = time.time() - merge_start
+                rate = (layer_idx + 1) / elapsed if elapsed > 0 else 0
+                eta = (len(layer_names) - layer_idx - 1) / rate if rate > 0 else 0
+                log_print(f"  [{layer_idx+1}/{len(layer_names)}] {layer_name} | ETA: {eta:.0f}s")
 
             # Get base layer parameters
             base_params = self._get_layer_params(merged_model, layer_name)
@@ -775,7 +824,7 @@ class LLaMAMerger:
                 logger.error(f"    Error merging {layer_name}: {e}")
                 continue
 
-        logger.info(f"\n✓ {method_name} merge complete!")
+        log_print(f"\n✓ {method_name} merge complete!")
         return merged_model
 
     def _find_matching_key(self, state_dict: Dict, layer_name: str) -> Optional[str]:
@@ -938,9 +987,9 @@ class LLaMAMerger:
         results = {}
 
         # Method 1: Simple TIES (magnitude)
-        logger.info("\n" + "=" * 60)
-        logger.info("METHOD 1: TIES with Magnitude-Based Trimming")
-        logger.info("=" * 60)
+        log_print("\n" + "=" * 60)
+        log_print("METHOD 1: TIES with Magnitude-Based Trimming")
+        log_print("=" * 60)
         start_time = time.time()
         ties_model = self.merge_with_ties(use_sparsegpt=False)
         ties_time = time.time() - start_time
@@ -949,7 +998,7 @@ class LLaMAMerger:
         ties_path = self.output_dir / "ties_magnitude"
         ties_model.save_pretrained(ties_path)
         tokenizer.save_pretrained(ties_path)
-        logger.info(f"Saved to: {ties_path}")
+        log_print(f"Saved to: {ties_path}")
 
         # Evaluate
         ties_metrics = self.evaluate_model(ties_model, tokenizer)
@@ -962,9 +1011,9 @@ class LLaMAMerger:
         torch.cuda.empty_cache()
 
         # Method 2: Simple DARE (random)
-        logger.info("\n" + "=" * 60)
-        logger.info("METHOD 2: DARE with Random Dropout")
-        logger.info("=" * 60)
+        log_print("\n" + "=" * 60)
+        log_print("METHOD 2: DARE with Random Dropout")
+        log_print("=" * 60)
         start_time = time.time()
         dare_model = self.merge_with_dare(use_sparsegpt=False)
         dare_time = time.time() - start_time
@@ -973,7 +1022,7 @@ class LLaMAMerger:
         dare_path = self.output_dir / "dare_random"
         dare_model.save_pretrained(dare_path)
         tokenizer.save_pretrained(dare_path)
-        logger.info(f"Saved to: {dare_path}")
+        log_print(f"Saved to: {dare_path}")
 
         # Evaluate
         dare_metrics = self.evaluate_model(dare_model, tokenizer)
@@ -986,9 +1035,9 @@ class LLaMAMerger:
         torch.cuda.empty_cache()
 
         # Method 3: SparseGPT-based (can use either TIES or DARE)
-        logger.info("\n" + "=" * 60)
-        logger.info("METHOD 3: TIES with SparseGPT Importance")
-        logger.info("=" * 60)
+        log_print("\n" + "=" * 60)
+        log_print("METHOD 3: TIES with SparseGPT Importance")
+        log_print("=" * 60)
         start_time = time.time()
         sparsegpt_model = self.merge_with_ties(use_sparsegpt=True)
         sparsegpt_time = time.time() - start_time
@@ -997,7 +1046,7 @@ class LLaMAMerger:
         sparsegpt_path = self.output_dir / "ties_sparsegpt"
         sparsegpt_model.save_pretrained(sparsegpt_path)
         tokenizer.save_pretrained(sparsegpt_path)
-        logger.info(f"Saved to: {sparsegpt_path}")
+        log_print(f"Saved to: {sparsegpt_path}")
 
         # Evaluate
         sparsegpt_metrics = self.evaluate_model(sparsegpt_model, tokenizer)
