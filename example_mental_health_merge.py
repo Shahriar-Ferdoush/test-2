@@ -17,13 +17,21 @@ from llama_merge import LLaMAMerger
 # Base model configuration
 BASE_MODEL = "meta-llama/Llama-3.2-1B-Instruct"
 
-# Fine-tuned models (can be local paths or HuggingFace IDs)
+# Fine-tuned models (MUST be HuggingFace IDs on Kaggle)
+# Format: "username/model-name" or "organization/model-name"
 FINETUNED_MODELS = [
-    "llama-3.2-1b-mental-health-counselor",  # Your mental health model
+    "your-username/llama-3.2-1b-mental-health-counselor",  # UPDATE THIS!
     # Add more fine-tuned models here if you have them
-    # "llama-3.2-1b-therapist",
-    # "llama-3.2-1b-wellness-coach",
+    # "your-username/llama-3.2-1b-therapist",
+    # "your-username/llama-3.2-1b-wellness-coach",
 ]
+
+# ⚠️ IMPORTANT FOR KAGGLE:
+# 1. Models MUST be on HuggingFace Hub (not Kaggle datasets)
+# 2. Use format: "username/model-name"
+# 3. If your model is in Kaggle dataset, copy it first:
+#    !cp -r /kaggle/input/your-dataset/model ./my_model
+#    Then use: FINETUNED_MODELS = ["./my_model"]
 
 # Datasets for calibration (one per fine-tuned model)
 DATASETS = [

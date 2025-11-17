@@ -182,7 +182,37 @@ Typical results on mental health data:
 # If no GPU, enable in Settings
 ```
 
-### Issue 2: "Dataset not found"
+### Issue 2: "Can't find 'adapter_config.json' at '/kaggle/input/...'"
+
+**This is the most common error!** You're using a Kaggle dataset path instead of a HuggingFace model ID.
+
+**❌ WRONG:**
+
+```python
+finetuned_model_paths=["/kaggle/input/my-model"]
+```
+
+**✅ SOLUTION 1 - Use HuggingFace ID (recommended):**
+
+```python
+# Upload model to HuggingFace first, then:
+finetuned_model_paths=["your-username/model-name"]
+```
+
+**✅ SOLUTION 2 - Copy from dataset:**
+
+```python
+# Copy from Kaggle dataset to working directory
+!cp -r /kaggle/input/my-model ./local_model
+!ls -la ./local_model  # Verify files copied
+
+# Then use local path
+finetuned_model_paths=["./local_model"]
+```
+
+**See [KAGGLE_TROUBLESHOOTING.md](KAGGLE_TROUBLESHOOTING.md) for complete diagnostic guide!**
+
+### Issue 3: "Dataset not found"
 
 ```python
 # The script auto-generates dummy data as fallback

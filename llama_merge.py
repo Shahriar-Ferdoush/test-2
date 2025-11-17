@@ -306,28 +306,91 @@ class LLaMAMerger:
         Returns:
             Loaded model
         """
+        import os
+
+        # Check if path is a Kaggle dataset path
+        if "/kaggle/input/" in ft_model_path:
+            logger.error(f"\n{'='*80}")
+            logger.error("ERROR: Kaggle dataset path detected!")
+            logger.error(f"Path: {ft_model_path}")
+            logger.error("\nKaggle datasets don't work directly with this code.")
+            logger.error("\nSOLUTIONS:")
+            logger.error("\n1. Use HuggingFace model ID (recommended):")
+            logger.error("   finetuned_model_paths=['your-username/model-name']")
+            logger.error("\n2. Copy from Kaggle dataset to working directory:")
+            logger.error("   !cp -r /kaggle/input/your-dataset/model ./my_model")
+            logger.error("   finetuned_model_paths=['./my_model']")
+            logger.error("\n3. Upload model to HuggingFace Hub first:")
+            logger.error("   model.push_to_hub('your-username/model-name')")
+            logger.error(f"{'='*80}\n")
+            raise ValueError(
+                f"Cannot load from Kaggle dataset path: {ft_model_path}. "
+                "Please use HuggingFace model ID or copy to working directory."
+            )
+
+        # Check if path exists (for local paths)
+        if not ft_model_path.startswith("http") and "/" not in ft_model_path:
+            # Looks like a HuggingFace ID, let it try to download
+            pass
+        elif os.path.exists(ft_model_path):
+            # Local path exists, verify it has model files
+            required_files = ["config.json"]
+            model_files = [
+                "pytorch_model.bin",
+                "model.safetensors",
+                "adapter_model.bin",
+            ]
+
+            if not any(
+                os.path.exists(os.path.join(ft_model_path, f)) for f in required_files
+            ):
+                logger.error(f"\n{'='*80}")
+                logger.error(f"ERROR: Path exists but missing model files!")
+                logger.error(f"Path: {ft_model_path}")
+                logger.error(f"\nFound files: {os.listdir(ft_model_path)[:10]}")
+                logger.error(f"\nExpected one of: {model_files + required_files}")
+                logger.error(f"{'='*80}\n")
+
         try:
             # Try loading as full model first
+            logger.info("  Attempting to load as full fine-tuned model...")
             model = AutoModelForCausalLM.from_pretrained(
                 ft_model_path, torch_dtype=torch.float16, device_map="cpu"
             )
-            logger.info("  Loaded as full model")
+            logger.info("  ✓ Loaded as full model")
             return model
-        except:
+        except Exception as full_model_error:
             # Try loading as LoRA adapter
             try:
-                logger.info("  Loading as LoRA adapter...")
+                logger.info("  Full model failed, trying as LoRA adapter...")
                 base_model = AutoModelForCausalLM.from_pretrained(
                     base_model_path, torch_dtype=torch.float16, device_map="cpu"
                 )
                 model = PeftModel.from_pretrained(base_model, ft_model_path)
                 # Merge LoRA weights into base model
                 model = model.merge_and_unload()
-                logger.info("  Loaded and merged LoRA adapter")
+                logger.info("  ✓ Loaded and merged LoRA adapter")
                 return model
-            except Exception as e:
-                logger.error(f"  Failed to load model: {e}")
-                raise
+            except Exception as lora_error:
+                logger.error(f"\n{'='*80}")
+                logger.error(
+                    "ERROR: Failed to load model as both full model and LoRA adapter"
+                )
+                logger.error(f"\nPath: {ft_model_path}")
+                logger.error(f"\nFull model error: {str(full_model_error)[:200]}")
+                logger.error(f"\nLoRA error: {str(lora_error)[:200]}")
+                logger.error("\nPossible causes:")
+                logger.error("1. Path is incorrect")
+                logger.error("2. Model files are missing or corrupted")
+                logger.error("3. Not a valid model format")
+                logger.error(
+                    "4. Using Kaggle dataset path (use HuggingFace ID instead)"
+                )
+                logger.error(f"{'='*80}\n")
+                raise ValueError(
+                    f"Failed to load model from {ft_model_path}. "
+                    "Check logs above for details."
+                )
 
     # ============================================================================
     # STEP 3: Compute Hessians for SparseGPT
