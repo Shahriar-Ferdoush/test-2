@@ -62,6 +62,7 @@ shutil.copytree(source_path, local_path)
 ```
 
 **Now produces:**
+
 ```
 ./lora_adapter_1/
 ├── adapter_config.json         ← At top level! ✅
@@ -86,13 +87,14 @@ else:
     if len(subdirs) == 1 and no files at top level:
         nested_path = os.path.join(ft_model_path, subdirs[0])
         nested_files = os.listdir(nested_path)
-        
+
         if "adapter_config.json" in nested_files:
             is_lora = True
             actual_model_path = nested_path  # Use nested path!
 ```
 
 **Key improvements:**
+
 - Detects nested LoRA adapters automatically
 - Uses `actual_model_path` variable for correct path
 - Logs both original and actual paths for debugging
@@ -100,6 +102,7 @@ else:
 ## 📊 BEFORE vs AFTER
 
 ### **BEFORE (Error):**
+
 ```
 WARNING:llama_merge: No config files found in ./lora_adapter_1
 ERROR:llama_merge: Unrecognized model in ./lora_adapter_1
@@ -107,6 +110,7 @@ ValueError: Failed to load model from ./lora_adapter_1
 ```
 
 ### **AFTER (Success):**
+
 ```
 [1] Processing: /kaggle/input/llama3-2-1b-instruct-ft-doctor-consulting
     Contents: ['llama-3-1b-medical-chatbot-v1']
@@ -126,12 +130,14 @@ ValueError: Failed to load model from ./lora_adapter_1
 ### **Files Modified:**
 
 #### **1. model-merge.ipynb (Cell 2):**
+
 - Added nested directory detection
 - Auto-unwraps single-subdirectory structures
 - Better file listing and diagnostics
 - Clear visual feedback (emoji indicators)
 
-#### **2. llama_merge.py (_load_finetuned_model):**
+#### **2. llama_merge.py (\_load_finetuned_model):**
+
 - Added `actual_model_path` variable
 - Nested directory detection logic
 - Uses `actual_model_path` for all loading operations
@@ -141,6 +147,7 @@ ValueError: Failed to load model from ./lora_adapter_1
 ## 🔬 WHY THIS HAPPENED
 
 Kaggle datasets are often structured like:
+
 ```
 dataset-name/
 └── model-or-data-folder/
@@ -148,6 +155,7 @@ dataset-name/
 ```
 
 This is **by design** - when you upload a folder to Kaggle, it becomes:
+
 - Dataset name = parent folder
 - Your uploaded folder = subfolder inside
 
@@ -163,6 +171,7 @@ git push origin main
 ```
 
 **In Kaggle:**
+
 1. Cell 1: Setup (clones updated repo)
 2. **Cell 2: Will now automatically detect and unwrap nested directories**
 3. Cell 3+: Merge will work with correct paths
@@ -170,11 +179,13 @@ git push origin main
 ## ✅ VERIFICATION
 
 After running Cell 2, you should see:
+
 ```
 ✅ Valid LoRA adapter confirmed
 ```
 
 **If you still see warnings:**
+
 - Check the "Subdirectories found" message
 - Verify your Kaggle dataset structure
 - The code now handles both flat and nested structures!

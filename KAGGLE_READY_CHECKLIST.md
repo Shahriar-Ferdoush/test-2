@@ -11,12 +11,14 @@
 ## 🔧 CHANGES MADE
 
 ### **1. llama_merge.py**
+
 - ✅ Added nested directory detection in `_load_finetuned_model()`
 - ✅ Introduced `actual_model_path` variable for corrected paths
 - ✅ Enhanced error messages with file listings
 - ✅ Logs both original and actual paths for debugging
 
 **Key code addition:**
+
 ```python
 # Detect single subdirectory (nested structure)
 subdirs = [d for d in files_in_path if os.path.isdir(...)]
@@ -28,6 +30,7 @@ if len(subdirs) == 1 and no_files_at_top_level:
 ```
 
 ### **2. model-merge.ipynb**
+
 - ✅ Updated Cell 2 (LoRA adapter copying script)
 - ✅ Auto-detects nested directories before copying
 - ✅ Unwraps single-subdirectory structures
@@ -35,6 +38,7 @@ if len(subdirs) == 1 and no_files_at_top_level:
 - ✅ Shows subdirectory detection in output
 
 **Key code addition:**
+
 ```python
 # Check if there's a single subdirectory
 subdirs = [d for d in contents if os.path.isdir(...)]
@@ -44,6 +48,7 @@ if len(subdirs) == 1 and len(files) == 0:
 ```
 
 ### **3. NESTED_DIRECTORY_FIX.md** (NEW)
+
 - ✅ Complete documentation of the issue
 - ✅ Before/after comparisons
 - ✅ Visual diagrams of directory structures
@@ -54,6 +59,7 @@ if len(subdirs) == 1 and len(files) == 0:
 ## 🎯 WHAT THIS FIXES
 
 ### **Before Fix:**
+
 ```
 ERROR: Unrecognized model in ./lora_adapter_1
 ❌ Code looked for: ./lora_adapter_1/adapter_config.json
@@ -61,6 +67,7 @@ ERROR: Unrecognized model in ./lora_adapter_1
 ```
 
 ### **After Fix:**
+
 ```
 ✅ Detects nested structure automatically
 ✅ Unwraps during copy: copies FROM subdirectory
@@ -112,13 +119,14 @@ After pushing, your Kaggle notebook will:
 3. **Cell 3+:** Merge will work with correct paths
 
 **Expected output:**
+
 ```
 [1] Processing: /kaggle/input/llama3-2-1b-instruct-ft-doctor-consulting
     Contents: ['llama-3-1b-medical-chatbot-v1']
     ℹ️  Found nested directory: llama-3-1b-medical-chatbot-v1
     Using: /kaggle/input/.../llama-3-1b-medical-chatbot-v1
     Copying to: ./lora_adapter_1
-    
+
     ✓ Copied 6 items
     Top-level files:
       - adapter_config.json (0.01 MB)
@@ -167,11 +175,13 @@ You'll know it's working when:
 Check these:
 
 1. **Verify dataset structure in Kaggle:**
+
    ```python
    !ls -R /kaggle/input/llama3-2-1b-instruct-ft-doctor-consulting
    ```
 
 2. **Check copied files:**
+
    ```python
    !ls -la ./lora_adapter_1
    ```
@@ -189,6 +199,7 @@ Check these:
 ## 📚 DOCUMENTATION FILES
 
 All documentation created:
+
 1. ✅ `NESTED_DIRECTORY_FIX.md` - This issue fix
 2. ✅ `LORA_ADAPTER_FIX.md` - Previous LoRA detection fix
 3. ✅ `KAGGLE_NO_HF_NEEDED.md` - No HuggingFace required
@@ -203,6 +214,7 @@ All documentation created:
 **CODE STATUS:** ✅ **PRODUCTION READY FOR KAGGLE**
 
 All known issues resolved:
+
 - ✅ Kaggle dataset path handling
 - ✅ LoRA adapter detection
 - ✅ Nested directory structures

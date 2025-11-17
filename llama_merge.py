@@ -331,7 +331,7 @@ class LLaMAMerger:
         # Check if path exists and determine model type
         is_lora = False
         actual_model_path = ft_model_path
-        
+
         if os.path.exists(ft_model_path):
             files_in_path = os.listdir(ft_model_path)
             logger.info(f"  Found {len(files_in_path)} items in {ft_model_path}")
@@ -345,28 +345,52 @@ class LLaMAMerger:
                 logger.info("  ✓ Detected full model format")
             else:
                 # Check if there's a single subdirectory (common in Kaggle datasets)
-                subdirs = [d for d in files_in_path if os.path.isdir(os.path.join(ft_model_path, d))]
-                if len(subdirs) == 1 and len([f for f in files_in_path if os.path.isfile(os.path.join(ft_model_path, f))]) == 0:
+                subdirs = [
+                    d
+                    for d in files_in_path
+                    if os.path.isdir(os.path.join(ft_model_path, d))
+                ]
+                if (
+                    len(subdirs) == 1
+                    and len(
+                        [
+                            f
+                            for f in files_in_path
+                            if os.path.isfile(os.path.join(ft_model_path, f))
+                        ]
+                    )
+                    == 0
+                ):
                     # Only one subdirectory and no files at this level - likely nested
                     nested_path = os.path.join(ft_model_path, subdirs[0])
-                    logger.warning(f"  No config files at top level, checking subdirectory: {subdirs[0]}")
-                    
+                    logger.warning(
+                        f"  No config files at top level, checking subdirectory: {subdirs[0]}"
+                    )
+
                     nested_files = os.listdir(nested_path)
                     logger.info(f"  Found in subdirectory: {nested_files[:10]}")
-                    
+
                     if "adapter_config.json" in nested_files:
                         is_lora = True
                         actual_model_path = nested_path
-                        logger.info(f"  ✓ Found LoRA adapter in subdirectory: {subdirs[0]}")
+                        logger.info(
+                            f"  ✓ Found LoRA adapter in subdirectory: {subdirs[0]}"
+                        )
                     elif "config.json" in nested_files:
                         actual_model_path = nested_path
-                        logger.info(f"  ✓ Found full model in subdirectory: {subdirs[0]}")
+                        logger.info(
+                            f"  ✓ Found full model in subdirectory: {subdirs[0]}"
+                        )
                     else:
-                        logger.warning(f"  No config files found in subdirectory either")
+                        logger.warning(
+                            f"  No config files found in subdirectory either"
+                        )
                 else:
                     logger.warning(f"  No config files found in {ft_model_path}")
                     logger.warning(f"  Subdirectories: {subdirs}")
-                    logger.warning(f"  Files: {[f for f in files_in_path if os.path.isfile(os.path.join(ft_model_path, f))]}")
+                    logger.warning(
+                        f"  Files: {[f for f in files_in_path if os.path.isfile(os.path.join(ft_model_path, f))]}"
+                    )
 
         # Try loading based on detected type
         if is_lora:
