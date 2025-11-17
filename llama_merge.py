@@ -388,10 +388,15 @@ class LLaMAMerger:
     # HELPER: On-the-fly Task Vector Computation
     # ============================================================================
 
-    def _compute_task_vectors_for_layer(self, layer_name: str) -> List[torch.Tensor]:
+    def _compute_task_vectors_for_layer(
+        self, layer_name: str
+    ) -> tuple[List[torch.Tensor], torch.device]:
         """
         Compute task vectors on-the-fly for a specific layer.
         This eliminates the need to cache 6GB task vector files!
+
+        Returns:
+            tuple: (task_vectors, model_device) - List of task vectors and the device models are on
 
         OPTIMIZATION: Cache ft models to avoid reloading for EVERY layer!
 
@@ -481,7 +486,7 @@ class LLaMAMerger:
             task_vector = ft_params.to(base_params.device) - base_params
             task_vectors.append(task_vector)
 
-        return task_vectors, self._model_device, base_params.device
+        return task_vectors, self._model_device
 
     def _load_lora_merged_model(
         self, lora_path: str, layer_name: str = None
@@ -975,6 +980,7 @@ class LLaMAMerger:
         # Merge layer by layer
         log_print(f"\nMerging {len(layer_names)} layers...")
         merge_start = time.time()
+        failed_layers = []
         for layer_idx, layer_name in enumerate(layer_names):
             if (layer_idx + 1) % 10 == 0 or layer_idx == 0:
                 elapsed = time.time() - merge_start
@@ -988,7 +994,9 @@ class LLaMAMerger:
             base_params = self._get_layer_params(merged_model, layer_name)
 
             # Compute task vectors on-the-fly (NO STORAGE!)
-            task_vectors, model_device = self._compute_task_vectors_for_layer(layer_name)
+            task_vectors, model_device = self._compute_task_vectors_for_layer(
+                layer_name
+            )
 
             # Load importance masks if using SparseGPT
             importance_masks = None
@@ -1008,19 +1016,34 @@ class LLaMAMerger:
                         )
                         importance_masks.append(dense_mask.to(model_device))
                     else:
-                        logger.warning(
-                            f"    Mask for {layer_name} not found in model {idx}"
+                        log_print(
+                            f"    ⚠ Mask for {layer_name} not found in model {idx}, using all-ones mask"
                         )
                         # Create dummy mask (all True) on correct device
                         importance_masks.append(
-                            torch.ones(base_params.numel(), dtype=torch.bool, device=model_device)
+                            torch.ones(
+                                base_params.numel(),
+                                dtype=torch.bool,
+                                device=model_device,
+                            )
                         )
 
                 # Apply masks directly to task vectors (bypass importance computation)
-                for i, mask in enumerate(importance_masks):
-                    task_vectors[i] = task_vectors[i] * mask.reshape(
-                        task_vectors[i].shape
+                if len(importance_masks) != len(task_vectors):
+                    log_print(
+                        f"    ⚠ Warning: {len(importance_masks)} masks but {len(task_vectors)} task vectors"
                     )
+                for i, mask in enumerate(importance_masks):
+                    if i < len(task_vectors):
+                        # Ensure mask shape matches task vector shape
+                        if mask.numel() != task_vectors[i].numel():
+                            log_print(
+                                f"    ⚠ Mask size mismatch: {mask.numel()} vs {task_vectors[i].numel()}, reshaping..."
+                            )
+                            mask = mask.reshape(task_vectors[i].shape)
+                        task_vectors[i] = task_vectors[i] * mask.reshape(
+                            task_vectors[i].shape
+                        )
 
             # Merge this layer
             # Note: When use_sparsegpt=True, we've already applied masks,
@@ -1067,8 +1090,18 @@ class LLaMAMerger:
                         raise  # Update merged model
                 self._set_layer_params(merged_model, layer_name, merged_params)
             except Exception as e:
+                log_print(f"    ❌ Error merging {layer_name}: {e}")
                 logger.error(f"    Error merging {layer_name}: {e}")
+                failed_layers.append((layer_name, str(e)))
                 continue
+
+        # Report failures
+        if failed_layers:
+            log_print(f"\n⚠ Warning: {len(failed_layers)} layers failed to merge:")
+            for layer, error in failed_layers[:5]:  # Show first 5
+                log_print(f"  - {layer}: {error}")
+            if len(failed_layers) > 5:
+                log_print(f"  ... and {len(failed_layers) - 5} more")
 
         # Cleanup base model cache
         self._clear_base_model_cache()
@@ -1121,6 +1154,7 @@ class LLaMAMerger:
         # Merge layer by layer
         log_print(f"\nMerging {len(layer_names)} layers...")
         merge_start = time.time()
+        failed_layers = []
         for layer_idx, layer_name in enumerate(layer_names):
             if (layer_idx + 1) % 10 == 0 or layer_idx == 0:
                 elapsed = time.time() - merge_start
@@ -1134,7 +1168,9 @@ class LLaMAMerger:
             base_params = self._get_layer_params(merged_model, layer_name)
 
             # Compute task vectors on-the-fly (NO STORAGE!)
-            task_vectors, model_device = self._compute_task_vectors_for_layer(layer_name)
+            task_vectors, model_device = self._compute_task_vectors_for_layer(
+                layer_name
+            )
 
             # Load importance masks if using SparseGPT
             importance_masks = None
@@ -1154,8 +1190,15 @@ class LLaMAMerger:
                         )
                         importance_masks.append(dense_mask.to(model_device))
                     else:
+                        log_print(
+                            f"    ⚠ Mask for {layer_name} not found in model {idx}, using all-ones mask"
+                        )
                         importance_masks.append(
-                            torch.ones(base_params.numel(), dtype=torch.bool, device=model_device)
+                            torch.ones(
+                                base_params.numel(),
+                                dtype=torch.bool,
+                                device=model_device,
+                            )
                         )
 
                 # Apply masks directly to task vectors
@@ -1210,8 +1253,18 @@ class LLaMAMerger:
                 # Update merged model
                 self._set_layer_params(merged_model, layer_name, merged_params)
             except Exception as e:
+                log_print(f"    ❌ Error merging {layer_name}: {e}")
                 logger.error(f"    Error merging {layer_name}: {e}")
+                failed_layers.append((layer_name, str(e)))
                 continue
+
+        # Report failures
+        if failed_layers:
+            log_print(f"\n⚠ Warning: {len(failed_layers)} layers failed to merge:")
+            for layer, error in failed_layers[:5]:  # Show first 5
+                log_print(f"  - {layer}: {error}")
+            if len(failed_layers) > 5:
+                log_print(f"  ... and {len(failed_layers) - 5} more")
 
         # Cleanup base model cache
         self._clear_base_model_cache()
@@ -1252,9 +1305,23 @@ class LLaMAMerger:
         """Get parameters of a specific layer."""
         parts = layer_name.split(".")
         module = model
-        for part in parts:
-            module = getattr(module, part)
-        return module.weight.data.clone()
+        try:
+            for i, part in enumerate(parts):
+                if not hasattr(module, part):
+                    raise AttributeError(
+                        f"Module does not have attribute '{part}' (at position {i} in path {layer_name})"
+                    )
+                module = getattr(module, part)
+
+            if not hasattr(module, "weight"):
+                raise AttributeError(
+                    f"Layer '{layer_name}' does not have a weight attribute"
+                )
+
+            return module.weight.data.clone()
+        except Exception as e:
+            logger.error(f"Error getting layer params for {layer_name}: {e}")
+            raise
 
     def _set_layer_params(
         self, model: nn.Module, layer_name: str, params: torch.Tensor
@@ -1262,9 +1329,25 @@ class LLaMAMerger:
         """Set parameters of a specific layer."""
         parts = layer_name.split(".")
         module = model
-        for part in parts:
-            module = getattr(module, part)
-        module.weight.data = params.to(module.weight.dtype)
+        try:
+            for i, part in enumerate(parts):
+                if not hasattr(module, part):
+                    raise AttributeError(
+                        f"Module does not have attribute '{part}' (at position {i} in path {layer_name})"
+                    )
+                module = getattr(module, part)
+
+            if not hasattr(module, "weight"):
+                raise AttributeError(
+                    f"Layer '{layer_name}' does not have a weight attribute"
+                )
+
+            # Ensure params are on same device as module and correct dtype
+            params = params.to(device=module.weight.device, dtype=module.weight.dtype)
+            module.weight.data = params
+        except Exception as e:
+            logger.error(f"Error setting layer params for {layer_name}: {e}")
+            raise
 
     # ============================================================================
     # STEP 5: Evaluation and Comparison
