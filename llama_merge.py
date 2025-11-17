@@ -308,26 +308,6 @@ class LLaMAMerger:
         """
         import os
 
-        # Check if path is a Kaggle dataset path
-        if "/kaggle/input/" in ft_model_path:
-            logger.error(f"\n{'='*80}")
-            logger.error("ERROR: Kaggle dataset path detected!")
-            logger.error(f"Path: {ft_model_path}")
-            logger.error("\nKaggle datasets don't work directly with this code.")
-            logger.error("\nSOLUTIONS:")
-            logger.error("\n1. Use HuggingFace model ID (recommended):")
-            logger.error("   finetuned_model_paths=['your-username/model-name']")
-            logger.error("\n2. Copy from Kaggle dataset to working directory:")
-            logger.error("   !cp -r /kaggle/input/your-dataset/model ./my_model")
-            logger.error("   finetuned_model_paths=['./my_model']")
-            logger.error("\n3. Upload model to HuggingFace Hub first:")
-            logger.error("   model.push_to_hub('your-username/model-name')")
-            logger.error(f"{'='*80}\n")
-            raise ValueError(
-                f"Cannot load from Kaggle dataset path: {ft_model_path}. "
-                "Please use HuggingFace model ID or copy to working directory."
-            )
-
         # Check if path exists and determine model type
         is_lora = False
         actual_model_path = ft_model_path
