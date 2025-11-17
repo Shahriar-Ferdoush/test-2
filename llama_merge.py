@@ -330,18 +330,43 @@ class LLaMAMerger:
 
         # Check if path exists and determine model type
         is_lora = False
+        actual_model_path = ft_model_path
+        
         if os.path.exists(ft_model_path):
             files_in_path = os.listdir(ft_model_path)
-            logger.info(f"  Found files: {files_in_path[:10]}")
-            
+            logger.info(f"  Found {len(files_in_path)} items in {ft_model_path}")
+            logger.info(f"  Items: {files_in_path[:10]}")
+
             # Check if it's a LoRA adapter
             if "adapter_config.json" in files_in_path:
                 is_lora = True
-                logger.info("  Detected LoRA adapter format")
+                logger.info("  ✓ Detected LoRA adapter format")
             elif "config.json" in files_in_path:
-                logger.info("  Detected full model format")
+                logger.info("  ✓ Detected full model format")
             else:
-                logger.warning(f"  No config files found in {ft_model_path}")
+                # Check if there's a single subdirectory (common in Kaggle datasets)
+                subdirs = [d for d in files_in_path if os.path.isdir(os.path.join(ft_model_path, d))]
+                if len(subdirs) == 1 and len([f for f in files_in_path if os.path.isfile(os.path.join(ft_model_path, f))]) == 0:
+                    # Only one subdirectory and no files at this level - likely nested
+                    nested_path = os.path.join(ft_model_path, subdirs[0])
+                    logger.warning(f"  No config files at top level, checking subdirectory: {subdirs[0]}")
+                    
+                    nested_files = os.listdir(nested_path)
+                    logger.info(f"  Found in subdirectory: {nested_files[:10]}")
+                    
+                    if "adapter_config.json" in nested_files:
+                        is_lora = True
+                        actual_model_path = nested_path
+                        logger.info(f"  ✓ Found LoRA adapter in subdirectory: {subdirs[0]}")
+                    elif "config.json" in nested_files:
+                        actual_model_path = nested_path
+                        logger.info(f"  ✓ Found full model in subdirectory: {subdirs[0]}")
+                    else:
+                        logger.warning(f"  No config files found in subdirectory either")
+                else:
+                    logger.warning(f"  No config files found in {ft_model_path}")
+                    logger.warning(f"  Subdirectories: {subdirs}")
+                    logger.warning(f"  Files: {[f for f in files_in_path if os.path.isfile(os.path.join(ft_model_path, f))]}")
 
         # Try loading based on detected type
         if is_lora:
@@ -349,16 +374,16 @@ class LLaMAMerger:
             try:
                 logger.info("  Loading as LoRA adapter...")
                 logger.info(f"  Base model: {base_model_path}")
-                logger.info(f"  LoRA adapter: {ft_model_path}")
-                
+                logger.info(f"  LoRA adapter: {actual_model_path}")
+
                 base_model = AutoModelForCausalLM.from_pretrained(
                     base_model_path, torch_dtype=torch.float16, device_map="cpu"
                 )
                 logger.info("  ✓ Base model loaded")
-                
-                model = PeftModel.from_pretrained(base_model, ft_model_path)
+
+                model = PeftModel.from_pretrained(base_model, actual_model_path)
                 logger.info("  ✓ LoRA adapter loaded")
-                
+
                 # Merge LoRA weights into base model
                 model = model.merge_and_unload()
                 logger.info("  ✓ LoRA weights merged into base model")
@@ -367,12 +392,18 @@ class LLaMAMerger:
                 logger.error(f"\n{'='*80}")
                 logger.error("ERROR: Failed to load LoRA adapter")
                 logger.error(f"\nBase model path: {base_model_path}")
-                logger.error(f"LoRA adapter path: {ft_model_path}")
+                logger.error(f"LoRA adapter path: {actual_model_path}")
+                logger.error(f"Original path: {ft_model_path}")
                 logger.error(f"\nError: {str(e)}")
                 logger.error("\nTroubleshooting:")
                 logger.error("1. Check base_model_path is correct")
-                logger.error("2. Ensure adapter files exist (adapter_config.json, adapter_model.*)")
+                logger.error(
+                    "2. Ensure adapter files exist (adapter_config.json, adapter_model.*)"
+                )
                 logger.error("3. Verify base model and adapter are compatible")
+                logger.error(f"4. Check files at: {actual_model_path}")
+                if os.path.exists(actual_model_path):
+                    logger.error(f"   Files found: {os.listdir(actual_model_path)}")
                 logger.error(f"{'='*80}\n")
                 raise
         else:
@@ -380,22 +411,31 @@ class LLaMAMerger:
             try:
                 logger.info("  Attempting to load as full fine-tuned model...")
                 model = AutoModelForCausalLM.from_pretrained(
-                    ft_model_path, torch_dtype=torch.float16, device_map="cpu"
+                    actual_model_path, torch_dtype=torch.float16, device_map="cpu"
                 )
                 logger.info("  ✓ Loaded as full model")
                 return model
             except Exception as e:
                 logger.error(f"\n{'='*80}")
                 logger.error("ERROR: Failed to load as full model")
-                logger.error(f"\nPath: {ft_model_path}")
+                logger.error(f"\nPath: {actual_model_path}")
+                logger.error(f"Original path: {ft_model_path}")
                 logger.error(f"\nError: {str(e)[:300]}")
                 logger.error("\nPossible causes:")
-                logger.error("1. Missing model files (config.json, pytorch_model.bin/model.safetensors)")
+                logger.error(
+                    "1. Missing model files (config.json, pytorch_model.bin/model.safetensors)"
+                )
                 logger.error("2. Incorrect path")
-                logger.error("3. Model is actually a LoRA adapter (check for adapter_config.json)")
+                logger.error(
+                    "3. Model is actually a LoRA adapter (check for adapter_config.json)"
+                )
+                logger.error("4. Nested directory structure (check subdirectories)")
+                if os.path.exists(actual_model_path):
+                    logger.error(f"\nContents of {actual_model_path}:")
+                    logger.error(f"  {os.listdir(actual_model_path)}")
                 logger.error(f"{'='*80}\n")
                 raise ValueError(
-                    f"Failed to load model from {ft_model_path}. "
+                    f"Failed to load model from {actual_model_path}. "
                     "Check logs above for details."
                 )
 
