@@ -328,64 +328,71 @@ class LLaMAMerger:
                 "Please use HuggingFace model ID or copy to working directory."
             )
 
-        # Check if path exists (for local paths)
-        if not ft_model_path.startswith("http") and "/" not in ft_model_path:
-            # Looks like a HuggingFace ID, let it try to download
-            pass
-        elif os.path.exists(ft_model_path):
-            # Local path exists, verify it has model files
-            required_files = ["config.json"]
-            model_files = [
-                "pytorch_model.bin",
-                "model.safetensors",
-                "adapter_model.bin",
-            ]
+        # Check if path exists and determine model type
+        is_lora = False
+        if os.path.exists(ft_model_path):
+            files_in_path = os.listdir(ft_model_path)
+            logger.info(f"  Found files: {files_in_path[:10]}")
+            
+            # Check if it's a LoRA adapter
+            if "adapter_config.json" in files_in_path:
+                is_lora = True
+                logger.info("  Detected LoRA adapter format")
+            elif "config.json" in files_in_path:
+                logger.info("  Detected full model format")
+            else:
+                logger.warning(f"  No config files found in {ft_model_path}")
 
-            if not any(
-                os.path.exists(os.path.join(ft_model_path, f)) for f in required_files
-            ):
-                logger.error(f"\n{'='*80}")
-                logger.error(f"ERROR: Path exists but missing model files!")
-                logger.error(f"Path: {ft_model_path}")
-                logger.error(f"\nFound files: {os.listdir(ft_model_path)[:10]}")
-                logger.error(f"\nExpected one of: {model_files + required_files}")
-                logger.error(f"{'='*80}\n")
-
-        try:
-            # Try loading as full model first
-            logger.info("  Attempting to load as full fine-tuned model...")
-            model = AutoModelForCausalLM.from_pretrained(
-                ft_model_path, torch_dtype=torch.float16, device_map="cpu"
-            )
-            logger.info("  ✓ Loaded as full model")
-            return model
-        except Exception as full_model_error:
-            # Try loading as LoRA adapter
+        # Try loading based on detected type
+        if is_lora:
+            # Load as LoRA adapter directly
             try:
-                logger.info("  Full model failed, trying as LoRA adapter...")
+                logger.info("  Loading as LoRA adapter...")
+                logger.info(f"  Base model: {base_model_path}")
+                logger.info(f"  LoRA adapter: {ft_model_path}")
+                
                 base_model = AutoModelForCausalLM.from_pretrained(
                     base_model_path, torch_dtype=torch.float16, device_map="cpu"
                 )
+                logger.info("  ✓ Base model loaded")
+                
                 model = PeftModel.from_pretrained(base_model, ft_model_path)
+                logger.info("  ✓ LoRA adapter loaded")
+                
                 # Merge LoRA weights into base model
                 model = model.merge_and_unload()
-                logger.info("  ✓ Loaded and merged LoRA adapter")
+                logger.info("  ✓ LoRA weights merged into base model")
                 return model
-            except Exception as lora_error:
+            except Exception as e:
                 logger.error(f"\n{'='*80}")
-                logger.error(
-                    "ERROR: Failed to load model as both full model and LoRA adapter"
+                logger.error("ERROR: Failed to load LoRA adapter")
+                logger.error(f"\nBase model path: {base_model_path}")
+                logger.error(f"LoRA adapter path: {ft_model_path}")
+                logger.error(f"\nError: {str(e)}")
+                logger.error("\nTroubleshooting:")
+                logger.error("1. Check base_model_path is correct")
+                logger.error("2. Ensure adapter files exist (adapter_config.json, adapter_model.*)")
+                logger.error("3. Verify base model and adapter are compatible")
+                logger.error(f"{'='*80}\n")
+                raise
+        else:
+            # Try loading as full model
+            try:
+                logger.info("  Attempting to load as full fine-tuned model...")
+                model = AutoModelForCausalLM.from_pretrained(
+                    ft_model_path, torch_dtype=torch.float16, device_map="cpu"
                 )
+                logger.info("  ✓ Loaded as full model")
+                return model
+            except Exception as e:
+                logger.error(f"\n{'='*80}")
+                logger.error("ERROR: Failed to load as full model")
                 logger.error(f"\nPath: {ft_model_path}")
-                logger.error(f"\nFull model error: {str(full_model_error)[:200]}")
-                logger.error(f"\nLoRA error: {str(lora_error)[:200]}")
+                logger.error(f"\nError: {str(e)[:300]}")
                 logger.error("\nPossible causes:")
-                logger.error("1. Path is incorrect")
-                logger.error("2. Model files are missing or corrupted")
-                logger.error("3. Not a valid model format")
-                logger.error(
-                    "4. Using Kaggle dataset path (use HuggingFace ID instead)"
-                )
+                logger.error("1. Missing model files (config.json, pytorch_model.bin/model.safetensors)")
+                logger.error("2. Incorrect path")
+                logger.error("3. Model is actually a LoRA adapter (check for adapter_config.json)")
                 logger.error(f"{'='*80}\n")
                 raise ValueError(
                     f"Failed to load model from {ft_model_path}. "
