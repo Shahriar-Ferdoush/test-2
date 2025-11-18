@@ -418,6 +418,32 @@ class TIES:
         )
         # task_vectors is list of [out_features, in_features] tensors
 
+        # ========== VALIDATE INPUTS - CHECK FOR NaN/Inf IN TASK VECTORS ==========
+        for idx, tv in enumerate(task_vectors):
+            if torch.isnan(tv).any():
+                import warnings
+
+                nan_count = torch.isnan(tv).sum().item()
+                warnings.warn(
+                    f"Task vector {idx} contains {nan_count} NaN values! "
+                    f"This indicates corrupted fine-tuned model weights. "
+                    f"Replacing NaN with zeros."
+                )
+                task_vectors[idx] = torch.nan_to_num(tv, nan=0.0)
+
+            if torch.isinf(tv).any():
+                import warnings
+
+                inf_count = torch.isinf(tv).sum().item()
+                warnings.warn(
+                    f"Task vector {idx} contains {inf_count} Inf values! "
+                    f"This indicates numerical instability. "
+                    f"Replacing Inf with zeros."
+                )
+                task_vectors[idx] = torch.nan_to_num(
+                    tv, nan=0.0, posinf=0.0, neginf=0.0
+                )
+
         # ========== VALIDATE INPUTS FOR SPARSEGPT MODE ==========
         # Two modes: importance_masks (pre-computed) OR hessian_inv_diags (compute on-the-fly)
         if use_sparsegpt:
@@ -510,14 +536,61 @@ class TIES:
         # ========== STEP 6: NORMALIZE BY SUM OF AGREEING WEIGHTS ==========
         # Compute normalization factor: sum of weights where election mask is True
         # This ensures proper averaging (not just summing)
-        normalization_factor = (
-            (weights * elect_mask.to(weights.dtype)).sum(dim=0).clamp(min=1e-10)
-        )  # Clamp to avoid division by zero
+        #
+        # CRITICAL: At positions where NO tasks agree (all zeroed or all disagree),
+        # normalization_factor will be 0, causing division issues even with clamping.
+        # Solution: Where normalization_factor is effectively 0, don't apply any update
+        normalization_factor = (weights * elect_mask.to(weights.dtype)).sum(dim=0)
         # Shape: [out_features, in_features]
 
+        # Create mask for positions where we have valid updates
+        # (at least one task contributes)
+        valid_update_mask = normalization_factor > 1e-8
+
+        # For invalid positions, set normalization to 1.0 (will be zeroed anyway)
+        # This prevents division by tiny numbers
+        normalization_factor_safe = torch.where(
+            valid_update_mask,
+            normalization_factor,
+            torch.ones_like(normalization_factor),
+        )
+
         # Divide to get weighted average
-        normalized_merged_update = merged_update / normalization_factor
+        normalized_merged_update = merged_update / normalization_factor_safe
         # Shape: [out_features, in_features]
+
+        # Zero out positions where no tasks contributed (no valid update)
+        # This is CRITICAL: prevents adding garbage values where all tasks were trimmed/disagreed
+        normalized_merged_update = normalized_merged_update * valid_update_mask
+
+        # ========== CRITICAL: CHECK FOR NaN/Inf ==========
+        # These can occur if:
+        # 1. Input task vectors contain NaN/Inf
+        # 2. Normalization produces extreme values despite clamping
+        # 3. Numerical instability in float16 operations
+        if torch.isnan(normalized_merged_update).any():
+            import warnings
+
+            nan_count = torch.isnan(normalized_merged_update).sum().item()
+            warnings.warn(
+                f"NaN detected in TIES merge! {nan_count}/{normalized_merged_update.numel()} values. "
+                f"Replacing NaN with zeros."
+            )
+            normalized_merged_update = torch.nan_to_num(
+                normalized_merged_update, nan=0.0
+            )
+
+        if torch.isinf(normalized_merged_update).any():
+            import warnings
+
+            inf_count = torch.isinf(normalized_merged_update).sum().item()
+            warnings.warn(
+                f"Inf detected in TIES merge! {inf_count}/{normalized_merged_update.numel()} values. "
+                f"Replacing Inf with zeros."
+            )
+            normalized_merged_update = torch.nan_to_num(
+                normalized_merged_update, nan=0.0, posinf=0.0, neginf=0.0
+            )
 
         # ========== STEP 7: ADD MERGED UPDATE TO BASE MODEL ==========
         # Final merged parameters: θ_merged = θ_base + average(agreeing τ_i)

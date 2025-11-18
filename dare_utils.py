@@ -182,6 +182,32 @@ class DARE:
             device=device,
         )
 
+        # ========== VALIDATE INPUTS - CHECK FOR NaN/Inf IN TASK VECTORS ==========
+        for idx, tv in enumerate(task_vectors):
+            if torch.isnan(tv).any():
+                import warnings
+
+                nan_count = torch.isnan(tv).sum().item()
+                warnings.warn(
+                    f"Task vector {idx} contains {nan_count} NaN values! "
+                    f"This indicates corrupted fine-tuned model weights. "
+                    f"Replacing NaN with zeros."
+                )
+                task_vectors[idx] = torch.nan_to_num(tv, nan=0.0)
+
+            if torch.isinf(tv).any():
+                import warnings
+
+                inf_count = torch.isinf(tv).sum().item()
+                warnings.warn(
+                    f"Task vector {idx} contains {inf_count} Inf values! "
+                    f"This indicates numerical instability. "
+                    f"Replacing Inf with zeros."
+                )
+                task_vectors[idx] = torch.nan_to_num(
+                    tv, nan=0.0, posinf=0.0, neginf=0.0
+                )
+
         # Validate inputs for SparseGPT mode
         if use_sparsegpt:
             if importance_masks is not None:
@@ -201,7 +227,29 @@ class DARE:
 
         # Trim task vectors based on densities
         if use_sparsegpt and importance_masks is not None:
-            # Apply pre-computed importance masks\n            trimmed_task_vectors = []\n            for tv, mask in zip(task_vectors, importance_masks):\n                # Ensure mask is same shape as task vector\n                if mask.numel() == tv.numel():\n                    mask_reshaped = mask.reshape(tv.shape)\n                else:\n                    raise ValueError(\n                        f\"Mask size ({mask.numel()}) doesn't match task vector size ({tv.numel()})\"\n                    )\n                # Apply mask and rescale (DARE rescales by 1/density)\n                # Since mask already represents top-k selection, we need to\n                # rescale only the non-zero elements\n                masked_tv = tv * mask_reshaped\n                # Count non-zero elements to compute actual density\n                non_zero_count = (mask_reshaped != 0).sum().item()\n                actual_density = non_zero_count / mask_reshaped.numel()\n                if actual_density > 0:\n                    # Rescale to preserve magnitude\n                    trimmed_task_vectors.append(masked_tv / actual_density)\n                else:\n                    trimmed_task_vectors.append(masked_tv)\n        elif use_sparsegpt and hessian_inv_diags is not None:
+            # Apply pre-computed importance masks
+            trimmed_task_vectors = []
+            for tv, mask in zip(task_vectors, importance_masks):
+                # Ensure mask is same shape as task vector
+                if mask.numel() == tv.numel():
+                    mask_reshaped = mask.reshape(tv.shape)
+                else:
+                    raise ValueError(
+                        f"Mask size ({mask.numel()}) doesn't match task vector size ({tv.numel()})"
+                    )
+                # Apply mask and rescale (DARE rescales by 1/density)
+                # Since mask already represents top-k selection, we need to
+                # rescale only the non-zero elements
+                masked_tv = tv * mask_reshaped
+                # Count non-zero elements to compute actual density
+                non_zero_count = (mask_reshaped != 0).sum().item()
+                actual_density = non_zero_count / mask_reshaped.numel()
+                if actual_density > 0:
+                    # Rescale to preserve magnitude
+                    trimmed_task_vectors.append(masked_tv / actual_density)
+                else:
+                    trimmed_task_vectors.append(masked_tv)
+        elif use_sparsegpt and hessian_inv_diags is not None:
             trimmed_task_vectors = [
                 drop_and_rescale(
                     tv,
@@ -237,6 +285,29 @@ class DARE:
             torch.stack(trimmed_task_vectors).to(weights.device) * weights
         )
         merged_task_vector = weighted_task_vector.sum(dim=0)
+
+        # ========== CRITICAL: CHECK FOR NaN/Inf ==========
+        if torch.isnan(merged_task_vector).any():
+            import warnings
+
+            nan_count = torch.isnan(merged_task_vector).sum().item()
+            warnings.warn(
+                f"NaN detected in DARE merge! {nan_count}/{merged_task_vector.numel()} values. "
+                f"Replacing NaN with zeros."
+            )
+            merged_task_vector = torch.nan_to_num(merged_task_vector, nan=0.0)
+
+        if torch.isinf(merged_task_vector).any():
+            import warnings
+
+            inf_count = torch.isinf(merged_task_vector).sum().item()
+            warnings.warn(
+                f"Inf detected in DARE merge! {inf_count}/{merged_task_vector.numel()} values. "
+                f"Replacing Inf with zeros."
+            )
+            merged_task_vector = torch.nan_to_num(
+                merged_task_vector, nan=0.0, posinf=0.0, neginf=0.0
+            )
 
         # Add merged task vector to base model parameters
         merged_model_parameters = base_model_parameters + merged_task_vector
