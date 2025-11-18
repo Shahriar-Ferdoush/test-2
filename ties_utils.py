@@ -323,6 +323,9 @@ class TIES:
         densities: List[float],
         device: Optional[torch.device] = None,
         hessian_inv_diags: Optional[List[torch.Tensor]] = None,
+        importance_masks: Optional[
+            List[torch.Tensor]
+        ] = None,  # NEW: Pre-computed masks
         use_sparsegpt: bool = False,
         **kwargs,
     ) -> torch.Tensor:
@@ -416,18 +419,43 @@ class TIES:
         # task_vectors is list of [out_features, in_features] tensors
 
         # ========== VALIDATE INPUTS FOR SPARSEGPT MODE ==========
-        if use_sparsegpt and hessian_inv_diags is None:
-            raise ValueError("hessian_inv_diags is required when use_sparsegpt=True")
-
-        if use_sparsegpt and len(hessian_inv_diags) != len(task_vectors):
-            raise ValueError(
-                f"Number of hessian_inv_diags ({len(hessian_inv_diags)}) must match number of task vectors ({len(task_vectors)})"
-            )
+        # Two modes: importance_masks (pre-computed) OR hessian_inv_diags (compute on-the-fly)
+        if use_sparsegpt:
+            if importance_masks is not None:
+                # Mode 1: Use pre-computed importance masks
+                if len(importance_masks) != len(task_vectors):
+                    raise ValueError(
+                        f"Number of importance_masks ({len(importance_masks)}) must match number of task vectors ({len(task_vectors)})"
+                    )
+            elif hessian_inv_diags is not None:
+                # Mode 2: Compute masks from Hessian diagonals
+                if len(hessian_inv_diags) != len(task_vectors):
+                    raise ValueError(
+                        f"Number of hessian_inv_diags ({len(hessian_inv_diags)}) must match number of task vectors ({len(task_vectors)})"
+                    )
+            else:
+                raise ValueError(
+                    "Either importance_masks or hessian_inv_diags is required when use_sparsegpt=True"
+                )
 
         # ========== STEP 1: TRIM TASK VECTORS ==========
         # Keep only top-k% most important weights in each task vector
-        if use_sparsegpt:
-            # SparseGPT mode: importance = τ^2 / (H^-1)^2
+        if use_sparsegpt and importance_masks is not None:
+            # Mode 1: Apply pre-computed importance masks directly
+            # IMPORTANT: Masks are already computed with correct density, just apply them
+            trimmed_task_vectors = []
+            for tv, mask in zip(task_vectors, importance_masks):
+                # Ensure mask is same shape as task vector
+                if mask.numel() == tv.numel():
+                    mask_reshaped = mask.reshape(tv.shape)
+                else:
+                    raise ValueError(
+                        f"Mask size ({mask.numel()}) doesn't match task vector size ({tv.numel()})"
+                    )
+                # Apply mask (mask is float, 0.0 or 1.0)
+                trimmed_task_vectors.append(tv * mask_reshaped)
+        elif use_sparsegpt and hessian_inv_diags is not None:
+            # Mode 2: SparseGPT mode with Hessian - compute importance on-the-fly
             trimmed_task_vectors = [
                 trim(tv, density, hessian_inv_diag=h_inv, use_sparsegpt=True)
                 for tv, density, h_inv in zip(

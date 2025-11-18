@@ -281,6 +281,20 @@ class LLaMAMerger:
         log_print("=" * 60)
         log_print("Note: Computing on-the-fly, caching only masks to save space")
 
+        # CRITICAL WARNING: Check calibration sample count
+        if self.num_calibration_samples < 64:
+            log_print("\n" + "=" * 60)
+            log_print("⚠⚠⚠ WARNING: LOW CALIBRATION SAMPLE COUNT ⚠⚠⚠")
+            log_print("=" * 60)
+            log_print(f"Using only {self.num_calibration_samples} calibration samples")
+            log_print("Hessian estimates will be VERY NOISY with < 64 samples!")
+            log_print("This can lead to poor importance estimates and model collapse.")
+            log_print("")
+            log_print("Recommendations:")
+            log_print("  - For testing: Use magnitude-based TIES/DARE (no SparseGPT)")
+            log_print("  - For production: Use ≥64 samples (128+ recommended)")
+            log_print("=" * 60 + "\n")
+
         # Load tokenizer once
         tokenizer = AutoTokenizer.from_pretrained(self.base_model_path)
         if tokenizer.pad_token is None:
@@ -999,6 +1013,7 @@ class LLaMAMerger:
             )
 
             # Load importance masks if using SparseGPT
+            # CRITICAL: Do NOT apply masks here - let merger handle it to avoid double-trimming!
             importance_masks = None
             if use_sparsegpt:
                 importance_masks = []
@@ -1007,60 +1022,52 @@ class LLaMAMerger:
                     mask_dict = torch.load(mask_file, map_location="cpu")
                     full_key = self._find_matching_key(mask_dict, layer_name)
                     if full_key:
-                        # Convert sparse mask back to dense and move to model device
+                        # Convert sparse mask back to dense
                         sparse_mask = mask_dict[full_key]
                         dense_mask = (
                             sparse_mask.to_dense()
                             if sparse_mask.is_sparse
                             else sparse_mask
                         )
-                        importance_masks.append(dense_mask.to(model_device))
+                        # Convert to float and move to correct device
+                        # IMPORTANT: Must be float type for multiplication, not bool
+                        importance_masks.append(
+                            dense_mask.to(dtype=torch.float32, device=model_device)
+                        )
                     else:
                         log_print(
                             f"    ⚠ Mask for {layer_name} not found in model {idx}, using all-ones mask"
                         )
-                        # Create dummy mask (all True) on correct device
+                        # Create dummy mask (all ones) as float
                         importance_masks.append(
                             torch.ones(
-                                base_params.numel(),
-                                dtype=torch.bool,
+                                base_params.shape,
+                                dtype=torch.float32,
                                 device=model_device,
-                            )
+                            ).flatten()
                         )
 
-                # Apply masks directly to task vectors (bypass importance computation)
-                if len(importance_masks) != len(task_vectors):
-                    log_print(
-                        f"    ⚠ Warning: {len(importance_masks)} masks but {len(task_vectors)} task vectors"
-                    )
-                for i, mask in enumerate(importance_masks):
-                    if i < len(task_vectors):
-                        # Ensure mask shape matches task vector shape
-                        if mask.numel() != task_vectors[i].numel():
-                            log_print(
-                                f"    ⚠ Mask size mismatch: {mask.numel()} vs {task_vectors[i].numel()}, reshaping..."
-                            )
-                            mask = mask.reshape(task_vectors[i].shape)
-                        task_vectors[i] = task_vectors[i] * mask.reshape(
-                            task_vectors[i].shape
-                        )
+                # DO NOT apply masks here - merger will handle it!
+                # Applying masks here AND in merger causes double-trimming:
+                # Result: 0.2 * 0.2 = 0.04 = only 4% of weights survive!
 
             # Merge this layer
-            # Note: When use_sparsegpt=True, we've already applied masks,
-            # so we pass use_sparsegpt=False to merger to skip redundant computation
+            # IMPORTANT: Pass importance_masks to merger, don't pre-apply!
             try:
                 # Use same device as models for consistency
                 merge_device = model_device
 
                 try:
+                    # Pass task vectors directly - merger will apply trimming
+                    # If importance_masks is not None, use them; otherwise use magnitude
                     merged_params = merger.merge(
                         weights=[1.0] * len(task_vectors),
                         base_model_parameters=base_params,
                         ft_models_parameters=[base_params + tv for tv in task_vectors],
                         densities=[self.density] * len(task_vectors),
                         device=merge_device,
-                        hessian_inv_diags=None,  # Not needed - masks already applied
-                        use_sparsegpt=False,  # We've pre-applied masks above
+                        importance_masks=importance_masks,  # Pass masks to merger
+                        use_sparsegpt=use_sparsegpt,  # Use correct flag
                     )
                 except RuntimeError as e:
                     if "out of memory" in str(e).lower() or "cuda" in str(e).lower():
@@ -1073,6 +1080,11 @@ class LLaMAMerger:
                             # Move all tensors to CPU
                             base_params_cpu = base_params.to("cpu")
                             task_vectors_cpu = [tv.to("cpu") for tv in task_vectors]
+                            importance_masks_cpu = None
+                            if importance_masks is not None:
+                                importance_masks_cpu = [
+                                    m.to("cpu") for m in importance_masks
+                                ]
                             merged_params = merger.merge(
                                 weights=[1.0] * len(task_vectors_cpu),
                                 base_model_parameters=base_params_cpu,
@@ -1081,8 +1093,8 @@ class LLaMAMerger:
                                 ],
                                 densities=[self.density] * len(task_vectors_cpu),
                                 device=merge_device,
-                                hessian_inv_diags=None,
-                                use_sparsegpt=False,
+                                importance_masks=importance_masks_cpu,
+                                use_sparsegpt=use_sparsegpt,
                             )
                         else:
                             raise
@@ -1173,6 +1185,7 @@ class LLaMAMerger:
             )
 
             # Load importance masks if using SparseGPT
+            # CRITICAL: Do NOT apply masks here - let merger handle it!
             importance_masks = None
             if use_sparsegpt:
                 importance_masks = []
@@ -1181,34 +1194,33 @@ class LLaMAMerger:
                     mask_dict = torch.load(mask_file, map_location="cpu")
                     full_key = self._find_matching_key(mask_dict, layer_name)
                     if full_key:
-                        # Convert sparse mask back to dense and move to model device
+                        # Convert sparse mask back to dense
                         sparse_mask = mask_dict[full_key]
                         dense_mask = (
                             sparse_mask.to_dense()
                             if sparse_mask.is_sparse
                             else sparse_mask
                         )
-                        importance_masks.append(dense_mask.to(model_device))
+                        # Convert to float and move to correct device
+                        importance_masks.append(
+                            dense_mask.to(dtype=torch.float32, device=model_device)
+                        )
                     else:
                         log_print(
                             f"    ⚠ Mask for {layer_name} not found in model {idx}, using all-ones mask"
                         )
+                        # Create dummy mask (all ones) as float
                         importance_masks.append(
                             torch.ones(
-                                base_params.numel(),
-                                dtype=torch.bool,
+                                base_params.shape,
+                                dtype=torch.float32,
                                 device=model_device,
-                            )
+                            ).flatten()
                         )
 
-                # Apply masks directly to task vectors
-                for i, mask in enumerate(importance_masks):
-                    task_vectors[i] = task_vectors[i] * mask.reshape(
-                        task_vectors[i].shape
-                    )
+                # DO NOT apply masks here!
 
             # Merge this layer
-            # Note: When use_sparsegpt=True, we've already applied masks
             try:
                 # Use same device as models for consistency
                 merge_device = model_device
@@ -1220,8 +1232,8 @@ class LLaMAMerger:
                         ft_models_parameters=[base_params + tv for tv in task_vectors],
                         densities=[self.density] * len(task_vectors),
                         device=merge_device,
-                        hessian_inv_diags=None,  # Not needed - masks already applied
-                        use_sparsegpt=False,  # We've pre-applied masks above
+                        importance_masks=importance_masks,
+                        use_sparsegpt=use_sparsegpt,
                     )
                 except RuntimeError as e:
                     if "out of memory" in str(e).lower() or "cuda" in str(e).lower():

@@ -150,6 +150,9 @@ class DARE:
         densities: List[float],
         device: Optional[torch.device] = None,
         hessian_inv_diags: Optional[List[torch.Tensor]] = None,
+        importance_masks: Optional[
+            List[torch.Tensor]
+        ] = None,  # NEW: Pre-computed masks
         use_sparsegpt: bool = False,
         **kwargs,
     ) -> torch.Tensor:
@@ -180,16 +183,25 @@ class DARE:
         )
 
         # Validate inputs for SparseGPT mode
-        if use_sparsegpt and hessian_inv_diags is None:
-            raise ValueError("hessian_inv_diags is required when use_sparsegpt=True")
-
-        if use_sparsegpt and len(hessian_inv_diags) != len(task_vectors):
-            raise ValueError(
-                f"Number of hessian_inv_diags ({len(hessian_inv_diags)}) must match number of task vectors ({len(task_vectors)})"
-            )
+        if use_sparsegpt:
+            if importance_masks is not None:
+                if len(importance_masks) != len(task_vectors):
+                    raise ValueError(
+                        f"Number of importance_masks ({len(importance_masks)}) must match number of task vectors ({len(task_vectors)})"
+                    )
+            elif hessian_inv_diags is not None:
+                if len(hessian_inv_diags) != len(task_vectors):
+                    raise ValueError(
+                        f"Number of hessian_inv_diags ({len(hessian_inv_diags)}) must match number of task vectors ({len(task_vectors)})"
+                    )
+            else:
+                raise ValueError(
+                    "Either importance_masks or hessian_inv_diags is required when use_sparsegpt=True"
+                )
 
         # Trim task vectors based on densities
-        if use_sparsegpt:
+        if use_sparsegpt and importance_masks is not None:
+            # Apply pre-computed importance masks\n            trimmed_task_vectors = []\n            for tv, mask in zip(task_vectors, importance_masks):\n                # Ensure mask is same shape as task vector\n                if mask.numel() == tv.numel():\n                    mask_reshaped = mask.reshape(tv.shape)\n                else:\n                    raise ValueError(\n                        f\"Mask size ({mask.numel()}) doesn't match task vector size ({tv.numel()})\"\n                    )\n                # Apply mask and rescale (DARE rescales by 1/density)\n                # Since mask already represents top-k selection, we need to\n                # rescale only the non-zero elements\n                masked_tv = tv * mask_reshaped\n                # Count non-zero elements to compute actual density\n                non_zero_count = (mask_reshaped != 0).sum().item()\n                actual_density = non_zero_count / mask_reshaped.numel()\n                if actual_density > 0:\n                    # Rescale to preserve magnitude\n                    trimmed_task_vectors.append(masked_tv / actual_density)\n                else:\n                    trimmed_task_vectors.append(masked_tv)\n        elif use_sparsegpt and hessian_inv_diags is not None:
             trimmed_task_vectors = [
                 drop_and_rescale(
                     tv,
