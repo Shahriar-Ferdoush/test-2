@@ -462,12 +462,6 @@ class LLaMAMerger:
             tuple: (task_vectors, model_device) - List of task vectors and the device models are on
 
         OPTIMIZATION: Cache ft models to avoid reloading for EVERY layer!
-        OPTIMIZATION 2: LRU cache for task vectors - keep only last N layers to save memory!
-
-        Memory management:
-        - Each layer's task vectors: ~50-100MB (depends on layer size)
-        - Cache limit: 10 layers = ~500MB-1GB max
-        - Safe for Kaggle's 19.5GB limit (leaves plenty of room for models)
 
         Args:
             layer_name: Name of the layer (e.g., 'model.layers.0.mlp.gate_proj')
@@ -475,25 +469,6 @@ class LLaMAMerger:
         Returns:
             List of task vectors (one per fine-tuned model)
         """
-        # Initialize LRU cache with size limit
-        if not hasattr(self, "_task_vector_layer_cache"):
-            self._task_vector_layer_cache = {}
-            self._task_vector_cache_order = []  # Track access order for LRU
-            self._task_vector_cache_max_size = (
-                10  # Keep only last 10 layers (~500MB-1GB)
-            )
-
-        if layer_name in self._task_vector_layer_cache:
-            # Move to end of LRU queue (most recently used)
-            self._task_vector_cache_order.remove(layer_name)
-            self._task_vector_cache_order.append(layer_name)
-            # Track cache hit
-            if not hasattr(self, "_cache_stats"):
-                self._cache_stats = {"hits": 0, "misses": 0}
-            self._cache_stats["hits"] += 1
-            # Return cached task vectors (avoids recomputation across merge methods)
-            return self._task_vector_layer_cache[layer_name], self._model_device
-
         # Load base model if not cached
         if not hasattr(self, "_base_model_cache"):
             log_print("  Loading base model (cached for all layers)...")
@@ -573,24 +548,6 @@ class LLaMAMerger:
             # Ensure both are on same device
             task_vector = ft_params.to(base_params.device) - base_params
             task_vectors.append(task_vector)
-
-        # Cache task vectors with LRU eviction policy
-        # This prevents memory overflow when processing many layers
-        self._task_vector_layer_cache[layer_name] = task_vectors
-        self._task_vector_cache_order.append(layer_name)
-
-        # Track cache miss
-        if not hasattr(self, "_cache_stats"):
-            self._cache_stats = {"hits": 0, "misses": 0}
-        self._cache_stats["misses"] += 1
-
-        # Evict oldest entries if cache exceeds max size
-        while len(self._task_vector_cache_order) > self._task_vector_cache_max_size:
-            oldest_layer = self._task_vector_cache_order.pop(0)
-            if oldest_layer in self._task_vector_layer_cache:
-                del self._task_vector_layer_cache[oldest_layer]
-                # Log eviction for debugging (commented out to reduce noise)
-                # log_print(f"    [Cache] Evicted {oldest_layer} (LRU policy)")
 
         return task_vectors, self._model_device
 
@@ -1068,12 +1025,6 @@ class LLaMAMerger:
         logger.info(f"MERGING WITH {method_name}")
         logger.info("=" * 60)
 
-        # Initialize cache hit tracking
-        if not hasattr(self, "_cache_stats"):
-            self._cache_stats = {"hits": 0, "misses": 0}
-        initial_hits = self._cache_stats["hits"]
-        initial_misses = self._cache_stats["misses"]
-
         # Load base model
         logger.info("Loading base model...")
         merged_model = AutoModelForCausalLM.from_pretrained(
@@ -1213,18 +1164,6 @@ class LLaMAMerger:
             if len(failed_layers) > 5:
                 log_print(f"  ... and {len(failed_layers) - 5} more")
 
-        # Report cache statistics
-        if hasattr(self, "_cache_stats"):
-            hits = self._cache_stats["hits"] - initial_hits
-            misses = self._cache_stats["misses"] - initial_misses
-            total = hits + misses
-            if total > 0:
-                hit_rate = (hits / total) * 100
-                log_print(f"\n📊 Task Vector Cache Stats for {method_name}:")
-                log_print(f"   Cache Hits: {hits}/{total} ({hit_rate:.1f}%)")
-                log_print(f"   Cache Misses: {misses}/{total} ({100-hit_rate:.1f}%)")
-                log_print(f"   Memory Saved: ~{hits * 50}MB (est.)")
-
         # Cleanup base model cache
         self._clear_base_model_cache()
 
@@ -1239,14 +1178,8 @@ class LLaMAMerger:
             del self._ft_models_cache
         if hasattr(self, "_model_device"):
             del self._model_device
-        if hasattr(self, "_task_vector_layer_cache"):
-            # Clear task vector cache to free memory
-            del self._task_vector_layer_cache
-        if hasattr(self, "_task_vector_cache_order"):
-            del self._task_vector_cache_order
         gc.collect()
         torch.cuda.empty_cache()
-        log_print("  ✓ Cleared model caches and freed memory")
 
     def merge_with_dare(self, use_sparsegpt: bool = False) -> AutoModelForCausalLM:
         """
