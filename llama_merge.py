@@ -363,8 +363,15 @@ class LLaMAMerger:
                 layer = linear_layers[layer_name]
                 weight = layer.weight.data.cpu()
 
-                # Compute importance: |w|^2 * H^{-1}
-                importance = weight.pow(2) * h_inv_diag.unsqueeze(0)
+                # CRITICAL FIX: Use correct SparseGPT importance formula
+                # importance = w^2 / (H^{-1})^2
+                # NOT: w^2 * H^{-1}  (this is backwards!)
+                #
+                # Higher H^{-1} means MORE sensitive to changes → EASIER to remove → LOWER importance
+                # We want to keep weights where removal causes HIGH error
+                eps = 1e-10  # Numerical stability
+                h_inv_diag_broadcasted = h_inv_diag.unsqueeze(0)  # [1, in_features]
+                importance = weight.pow(2) / ((h_inv_diag_broadcasted + eps).pow(2))
 
                 # Get top-k mask (sparse boolean)
                 k = int(importance.numel() * self.density)
