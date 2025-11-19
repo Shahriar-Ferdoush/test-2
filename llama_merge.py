@@ -1038,6 +1038,17 @@ class LLaMAMerger:
         # TIES merger
         merger = TIES()
 
+        # PERFORMANCE OPTIMIZATION: Load mask files ONCE and cache them
+        cached_mask_dicts = None
+        if use_sparsegpt:
+            logger.info("Pre-loading importance mask files...")
+            cached_mask_dicts = []
+            for idx in range(len(self.finetuned_model_paths)):
+                mask_file = self.mask_dir / f"importance_mask_{idx}.pt"
+                mask_dict = torch.load(mask_file, map_location="cpu", weights_only=False)
+                cached_mask_dicts.append(mask_dict)
+                logger.info(f"  Loaded mask file {idx}: {mask_file.name} ({len(mask_dict)} layers)")
+
         # Merge layer by layer
         log_print(f"\nMerging {len(layer_names)} layers...")
         merge_start = time.time()
@@ -1060,24 +1071,16 @@ class LLaMAMerger:
             )
 
             # Load importance masks if using SparseGPT
-            # MEMORY OPTIMIZATION: Load only the specific layer's mask, not the entire file!
+            # MEMORY OPTIMIZATION: Use cached mask dicts instead of reloading from disk!
             importance_masks = None
             if use_sparsegpt:
                 importance_masks = []
-                for idx in range(len(self.finetuned_model_paths)):
-                    mask_file = self.mask_dir / f"importance_mask_{idx}.pt"
-                    
-                    # CRITICAL: Don't load entire file (742MB), just get the keys first
-                    mask_dict = torch.load(mask_file, map_location="cpu")
+                for idx, mask_dict in enumerate(cached_mask_dicts):
                     full_key = self._find_matching_key(mask_dict, layer_name)
-                    
+
                     if full_key:
-                        # Extract ONLY this layer's mask data
+                        # Extract this layer's mask data (no file I/O!)
                         mask_data = mask_dict[full_key]
-                        
-                        # Immediately delete the full dictionary to free memory
-                        del mask_dict
-                        torch.cuda.empty_cache()
 
                         # Check if it's the new format (dict with indices)
                         if isinstance(mask_data, dict) and "indices" in mask_data:
@@ -1085,31 +1088,23 @@ class LLaMAMerger:
                             indices = mask_data["indices"]
                             shape = mask_data["shape"]
 
-                            # Create mask: True at important indices, False elsewhere
-                            flat_mask = torch.zeros(
-                                shape[0] * shape[1], dtype=torch.float32
+                            # OPTIMIZED: Pre-allocate on correct device, scatter indices
+                            dense_mask = torch.zeros(
+                                shape, dtype=torch.float32, device=model_device
                             )
-                            flat_mask[indices] = 1.0
-                            dense_mask = flat_mask.reshape(shape)
+                            # Flatten, set indices, reshape in-place
+                            dense_mask.view(-1)[indices] = 1.0
                         else:
                             # Old format: sparse tensor or dense mask
-                            dense_mask = (
-                                mask_data.to_dense()
-                                if hasattr(mask_data, "to_dense")
-                                and mask_data.is_sparse
-                                else mask_data
-                            )
+                            if hasattr(mask_data, "to_dense") and mask_data.is_sparse:
+                                dense_mask = mask_data.to_dense()
+                            else:
+                                dense_mask = mask_data
+                            # Move to device
+                            dense_mask = dense_mask.to(dtype=torch.float32, device=model_device)
 
-                        # Convert to float and move to correct device
-                        # IMPORTANT: Must be float type for multiplication, not bool
-                        importance_masks.append(
-                            dense_mask.to(dtype=torch.float32, device=model_device)
-                        )
+                        importance_masks.append(dense_mask)
                     else:
-                        # Clean up before creating dummy
-                        del mask_dict
-                        torch.cuda.empty_cache()
-                        
                         log_print(
                             f"    ⚠ Mask for {layer_name} not found in model {idx}, using all-ones mask"
                         )
@@ -1190,6 +1185,11 @@ class LLaMAMerger:
             if len(failed_layers) > 5:
                 log_print(f"  ... and {len(failed_layers) - 5} more")
 
+        # Cleanup cached mask dictionaries to free memory
+        if cached_mask_dicts is not None:
+            del cached_mask_dicts
+            gc.collect()
+
         # Cleanup base model cache
         self._clear_base_model_cache()
 
@@ -1241,6 +1241,17 @@ class LLaMAMerger:
         # DARE merger
         merger = DARE()
 
+        # PERFORMANCE OPTIMIZATION: Load mask files ONCE and cache them
+        cached_mask_dicts = None
+        if use_sparsegpt:
+            logger.info("Pre-loading importance mask files...")
+            cached_mask_dicts = []
+            for idx in range(len(self.finetuned_model_paths)):
+                mask_file = self.mask_dir / f"importance_mask_{idx}.pt"
+                mask_dict = torch.load(mask_file, map_location="cpu", weights_only=False)
+                cached_mask_dicts.append(mask_dict)
+                logger.info(f"  Loaded mask file {idx}: {mask_file.name} ({len(mask_dict)} layers)")
+
         # Merge layer by layer
         log_print(f"\nMerging {len(layer_names)} layers...")
         merge_start = time.time()
@@ -1263,24 +1274,16 @@ class LLaMAMerger:
             )
 
             # Load importance masks if using SparseGPT
-            # MEMORY OPTIMIZATION: Load only the specific layer's mask, not the entire file!
+            # MEMORY OPTIMIZATION: Use cached mask dicts instead of reloading from disk!
             importance_masks = None
             if use_sparsegpt:
                 importance_masks = []
-                for idx in range(len(self.finetuned_model_paths)):
-                    mask_file = self.mask_dir / f"importance_mask_{idx}.pt"
-                    
-                    # CRITICAL: Don't load entire file (742MB), just get the keys first
-                    mask_dict = torch.load(mask_file, map_location="cpu")
+                for idx, mask_dict in enumerate(cached_mask_dicts):
                     full_key = self._find_matching_key(mask_dict, layer_name)
-                    
+
                     if full_key:
-                        # Extract ONLY this layer's mask data
+                        # Extract this layer's mask data (no file I/O!)
                         mask_data = mask_dict[full_key]
-                        
-                        # Immediately delete the full dictionary to free memory
-                        del mask_dict
-                        torch.cuda.empty_cache()
 
                         # Check if it's the new format (dict with indices)
                         if isinstance(mask_data, dict) and "indices" in mask_data:
@@ -1288,30 +1291,23 @@ class LLaMAMerger:
                             indices = mask_data["indices"]
                             shape = mask_data["shape"]
 
-                            # Create mask: True at important indices, False elsewhere
-                            flat_mask = torch.zeros(
-                                shape[0] * shape[1], dtype=torch.float32
+                            # OPTIMIZED: Pre-allocate on correct device, scatter indices
+                            dense_mask = torch.zeros(
+                                shape, dtype=torch.float32, device=model_device
                             )
-                            flat_mask[indices] = 1.0
-                            dense_mask = flat_mask.reshape(shape)
+                            # Flatten, set indices, reshape in-place
+                            dense_mask.view(-1)[indices] = 1.0
                         else:
                             # Old format: sparse tensor or dense mask
-                            dense_mask = (
-                                mask_data.to_dense()
-                                if hasattr(mask_data, "to_dense")
-                                and mask_data.is_sparse
-                                else mask_data
-                            )
+                            if hasattr(mask_data, "to_dense") and mask_data.is_sparse:
+                                dense_mask = mask_data.to_dense()
+                            else:
+                                dense_mask = mask_data
+                            # Move to device
+                            dense_mask = dense_mask.to(dtype=torch.float32, device=model_device)
 
-                        # Convert to float and move to correct device
-                        importance_masks.append(
-                            dense_mask.to(dtype=torch.float32, device=model_device)
-                        )
+                        importance_masks.append(dense_mask)
                     else:
-                        # Clean up before creating dummy
-                        del mask_dict
-                        torch.cuda.empty_cache()
-                        
                         log_print(
                             f"    ⚠ Mask for {layer_name} not found in model {idx}, using all-ones mask"
                         )
@@ -1383,6 +1379,11 @@ class LLaMAMerger:
                 log_print(f"  - {layer}: {error}")
             if len(failed_layers) > 5:
                 log_print(f"  ... and {len(failed_layers) - 5} more")
+
+        # Cleanup cached mask dictionaries to free memory
+        if cached_mask_dicts is not None:
+            del cached_mask_dicts
+            gc.collect()
 
         # Cleanup base model cache
         self._clear_base_model_cache()
