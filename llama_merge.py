@@ -300,6 +300,16 @@ class LLaMAMerger:
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
 
+        # CRITICAL FIX: Load base model ONCE to compute task vectors
+        # Importance must be calculated on task vectors (deltas), not absolute weights!
+        log_print("\n[SETUP] Loading base model for task vector computation...")
+        base_model = AutoModelForCausalLM.from_pretrained(
+            self.base_model_path,
+            torch_dtype=torch.float16,
+            device_map="cpu",  # Keep on CPU to save GPU memory
+        )
+        log_print("  ✓ Base model loaded")
+
         # Process each fine-tuned model
         for idx, (ft_model_path, dataset_name) in enumerate(
             zip(self.finetuned_model_paths, self.dataset_names)
@@ -357,21 +367,39 @@ class LLaMAMerger:
             log_print(
                 f"  [4/4] Generating importance masks (top {int(self.density*100)}% weights)..."
             )
+
+            # CRITICAL FIX: Compute task vectors first!
+            # Importance should be calculated on DELTAS (task vectors), not absolute weights
+            log_print("    Computing task vectors (ft_weight - base_weight)...")
+            base_linear_layers = self._find_linear_layers(base_model)
+
             importance_masks = {}
             for layer_name, h_inv_diag in hessian_inv_diags.items():
-                # Get layer to compute importance scores
-                layer = linear_layers[layer_name]
-                weight = layer.weight.data.cpu()
+                # Get fine-tuned layer weights
+                ft_layer = linear_layers[layer_name]
+                ft_weight = ft_layer.weight.data.cpu()
 
-                # CRITICAL FIX: Use correct SparseGPT importance formula
-                # importance = w^2 / (H^{-1})^2
-                # NOT: w^2 * H^{-1}  (this is backwards!)
-                #
-                # Higher H^{-1} means MORE sensitive to changes → EASIER to remove → LOWER importance
-                # We want to keep weights where removal causes HIGH error
+                # Get base layer weights
+                if layer_name not in base_linear_layers:
+                    log_print(
+                        f"    ⚠ Layer {layer_name} not found in base model, using ft weights directly"
+                    )
+                    task_vector = ft_weight
+                else:
+                    base_layer = base_linear_layers[layer_name]
+                    base_weight = base_layer.weight.data.cpu()
+
+                    # Compute TASK VECTOR: τ = θ_ft - θ_base
+                    task_vector = ft_weight - base_weight
+
+                # Calculate importance on TASK VECTOR (the actual change)
+                # importance = task_vector^2 / (H^{-1})^2
+                # This measures: "How important is THIS CHANGE given the Hessian?"
                 eps = 1e-10  # Numerical stability
                 h_inv_diag_broadcasted = h_inv_diag.unsqueeze(0)  # [1, in_features]
-                importance = weight.pow(2) / ((h_inv_diag_broadcasted + eps).pow(2))
+                importance = task_vector.pow(2) / (
+                    (h_inv_diag_broadcasted + eps).pow(2)
+                )
 
                 # Get top-k mask (sparse boolean)
                 k = int(importance.numel() * self.density)
@@ -399,6 +427,13 @@ class LLaMAMerger:
             gc.collect()
             torch.cuda.empty_cache()
             log_print(f"  ✓ Model {idx+1}/{len(self.finetuned_model_paths)} complete!")
+
+        # Clean up base model after all processing
+        log_print("\n[CLEANUP] Removing base model from memory...")
+        del base_model, base_linear_layers
+        gc.collect()
+        torch.cuda.empty_cache()
+        log_print("  ✓ Base model cleaned up")
 
         log_print("\n✓ Importance mask computation complete!")
         log_print(
