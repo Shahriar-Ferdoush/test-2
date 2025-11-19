@@ -129,17 +129,17 @@ class LLaMAMerger:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
-        # Cache subdirectories - optimized storage strategy
-        # We'll compute on-the-fly for magnitude-based methods
-        # Only cache importance masks (sparse) for SparseGPT
+        # Cache subdirectories
+        self.task_vector_dir = self.cache_dir / "task_vectors"
+        self.task_vector_dir.mkdir(exist_ok=True)
+
         self.mask_dir = self.cache_dir / "importance_masks"
         self.mask_dir.mkdir(exist_ok=True)
 
         log_print(f"Initialized LLaMAMerger with {len(finetuned_model_paths)} models")
         log_print(f"Device: {self.device}")
         log_print(f"Density: {self.density} (keep {self.density*100}% of weights)")
-        log_print(f"Storage optimization: Computing task vectors on-the-fly")
-        log_print(f"                       Only caching importance masks (~100MB each)")
+        log_print(f"Cache strategy: Task vectors + importance masks")
 
     # ============================================================================
     # STORAGE-OPTIMIZED APPROACH
