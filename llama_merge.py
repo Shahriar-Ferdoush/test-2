@@ -345,7 +345,9 @@ class LLaMAMerger:
 
             # Find all linear layers in fine-tuned model
             ft_linear_layers = self._find_linear_layers(model)
-            log_print(f"  Found {len(ft_linear_layers)} linear layers in fine-tuned model")
+            log_print(
+                f"  Found {len(ft_linear_layers)} linear layers in fine-tuned model"
+            )
 
             # Load base model to compute task vectors
             log_print(f"  [3/5] Loading base model for task vector computation...")
@@ -357,7 +359,9 @@ class LLaMAMerger:
             log_print(f"    ✓ Base model loaded (CPU)")
 
             # Compute Hessians from fine-tuned model (in memory only, not saved!)
-            log_print(f"  [4/5] Computing Hessians from fine-tuned model (temporary, in-memory)...")
+            log_print(
+                f"  [4/5] Computing Hessians from fine-tuned model (temporary, in-memory)..."
+            )
             hessian_inv_diags = self._compute_hessians_for_model(
                 model, ft_linear_layers, calibration_data
             )
@@ -372,9 +376,7 @@ class LLaMAMerger:
             log_print(
                 f"        CRITICAL: Computing importance on TASK VECTORS, not weights!"
             )
-            log_print(
-                f"        Task vector τ = θ_finetuned - θ_base"
-            )
+            log_print(f"        Task vector τ = θ_finetuned - θ_base")
             log_print(
                 f"        Importance = τ² / (H⁻¹)²  (error from undoing the change)"
             )
@@ -382,7 +384,7 @@ class LLaMAMerger:
                 f"        ═══════════════════════════════════════════════════════════"
             )
             importance_masks = {}
-            
+
             for layer_name, h_inv_diag in hessian_inv_diags.items():
                 try:
                     # Get fine-tuned layer weights
@@ -407,12 +409,18 @@ class LLaMAMerger:
 
                     # Handle NaN/Inf
                     if torch.isnan(task_vector).any() or torch.isinf(task_vector).any():
-                        log_print(f"    ⚠ Warning: NaN/Inf in task vector for {layer_name}, cleaning...")
-                        task_vector = torch.nan_to_num(task_vector, nan=0.0, posinf=0.0, neginf=0.0)
-                    
+                        log_print(
+                            f"    ⚠ Warning: NaN/Inf in task vector for {layer_name}, cleaning..."
+                        )
+                        task_vector = torch.nan_to_num(
+                            task_vector, nan=0.0, posinf=0.0, neginf=0.0
+                        )
+
                     # Check if task vector is essentially zero (no fine-tuning)
                     if task_vector.abs().max() < 1e-8:
-                        log_print(f"    ⚠ Warning: {layer_name} has zero task vector, using all-zeros mask")
+                        log_print(
+                            f"    ⚠ Warning: {layer_name} has zero task vector, using all-zeros mask"
+                        )
                         mask = torch.zeros_like(task_vector, dtype=torch.bool)
                         importance_masks[layer_name] = mask.to_sparse()
                         continue
@@ -434,20 +442,26 @@ class LLaMAMerger:
                     # This is EXACTLY the SparseGPT pruning criterion (line 96 in sparsegpt.py),
                     # but applied to TASK VECTORS instead of weights!
                     eps = 1e-10  # Numerical stability
-                    h_inv_diag_broadcasted = h_inv_diag.unsqueeze(0).float()  # [1, in_features]
+                    h_inv_diag_broadcasted = h_inv_diag.unsqueeze(
+                        0
+                    ).float()  # [1, in_features]
                     importance = task_vector.pow(2) / (
                         (h_inv_diag_broadcasted + eps).pow(2)
                     )
 
                     # Handle NaN/Inf in importance scores
                     if torch.isnan(importance).any() or torch.isinf(importance).any():
-                        log_print(f"    ⚠ Warning: NaN/Inf in importance for {layer_name}, cleaning...")
-                        importance = torch.nan_to_num(importance, nan=0.0, posinf=1e10, neginf=0.0)
+                        log_print(
+                            f"    ⚠ Warning: NaN/Inf in importance for {layer_name}, cleaning..."
+                        )
+                        importance = torch.nan_to_num(
+                            importance, nan=0.0, posinf=1e10, neginf=0.0
+                        )
 
                     # Get top-k mask (sparse boolean)
                     k = max(1, int(importance.numel() * self.density))
                     k = min(k, importance.numel())
-                    
+
                     if k >= importance.numel():
                         mask = torch.ones_like(importance, dtype=torch.bool)
                     else:
@@ -456,7 +470,7 @@ class LLaMAMerger:
                         mask = importance >= threshold
 
                     importance_masks[layer_name] = mask.cpu().to_sparse()
-                    
+
                 except Exception as e:
                     log_print(f"    ❌ Error processing {layer_name}: {e}")
                     log_print(f"       Creating fallback all-ones mask")
@@ -468,28 +482,31 @@ class LLaMAMerger:
 
             # Save masks ONLY (not Hessians!)
             log_print(f"  Saving importance masks: {mask_file}")
-            
+
             # Ensure parent directory exists
             mask_file.parent.mkdir(parents=True, exist_ok=True)
-            
+
             try:
                 torch.save(importance_masks, mask_file)
-                
+
                 if not mask_file.exists():
                     raise RuntimeError(f"File {mask_file} was not created")
-                
+
                 mask_size_mb = mask_file.stat().st_size / (1024**2)
                 log_print(f"  ✓ Saved {mask_size_mb:.1f}MB (vs ~6GB for full Hessian!)")
-                
+
             except Exception as e:
                 log_print(f"  ❌ Error saving masks: {e}")
                 log_print(f"     Attempting pickle fallback...")
-                
+
                 try:
                     import pickle
-                    pkl_file = mask_file.with_suffix('.pkl')
-                    with open(pkl_file, 'wb') as f:
-                        pickle.dump(importance_masks, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+                    pkl_file = mask_file.with_suffix(".pkl")
+                    with open(pkl_file, "wb") as f:
+                        pickle.dump(
+                            importance_masks, f, protocol=pickle.HIGHEST_PROTOCOL
+                        )
                     log_print(f"  ✓ Saved as pickle: {pkl_file}")
                 except Exception as e2:
                     log_print(f"  ❌ Pickle save also failed: {e2}")
@@ -1129,21 +1146,24 @@ class LLaMAMerger:
                 importance_masks = []
                 for idx in range(len(self.finetuned_model_paths)):
                     mask_file = self.mask_dir / f"importance_mask_{idx}.pt"
-                    
+
                     try:
                         # Try loading .pt file first
                         if mask_file.exists():
                             mask_dict = torch.load(mask_file, map_location="cpu")
                         else:
                             # Try pickle fallback
-                            pkl_file = mask_file.with_suffix('.pkl')
+                            pkl_file = mask_file.with_suffix(".pkl")
                             if pkl_file.exists():
                                 import pickle
-                                with open(pkl_file, 'rb') as f:
+
+                                with open(pkl_file, "rb") as f:
                                     mask_dict = pickle.load(f)
                             else:
-                                raise FileNotFoundError(f"No mask file found: {mask_file}")
-                        
+                                raise FileNotFoundError(
+                                    f"No mask file found: {mask_file}"
+                                )
+
                         full_key = self._find_matching_key(mask_dict, layer_name)
                         if full_key:
                             # Convert sparse mask back to dense
@@ -1170,7 +1190,7 @@ class LLaMAMerger:
                                     device=model_device,
                                 ).flatten()
                             )
-                    
+
                     except Exception as e:
                         log_print(f"    ❌ Error loading mask for model {idx}: {e}")
                         log_print(f"       Using all-ones fallback mask")
@@ -1326,21 +1346,24 @@ class LLaMAMerger:
                 importance_masks = []
                 for idx in range(len(self.finetuned_model_paths)):
                     mask_file = self.mask_dir / f"importance_mask_{idx}.pt"
-                    
+
                     try:
                         # Try loading .pt file first
                         if mask_file.exists():
                             mask_dict = torch.load(mask_file, map_location="cpu")
                         else:
                             # Try pickle fallback
-                            pkl_file = mask_file.with_suffix('.pkl')
+                            pkl_file = mask_file.with_suffix(".pkl")
                             if pkl_file.exists():
                                 import pickle
-                                with open(pkl_file, 'rb') as f:
+
+                                with open(pkl_file, "rb") as f:
                                     mask_dict = pickle.load(f)
                             else:
-                                raise FileNotFoundError(f"No mask file found: {mask_file}")
-                        
+                                raise FileNotFoundError(
+                                    f"No mask file found: {mask_file}"
+                                )
+
                         full_key = self._find_matching_key(mask_dict, layer_name)
                         if full_key:
                             # Convert sparse mask back to dense
@@ -1365,7 +1388,7 @@ class LLaMAMerger:
                                     device=model_device,
                                 ).flatten()
                             )
-                    
+
                     except Exception as e:
                         log_print(f"    ❌ Error loading mask for model {idx}: {e}")
                         log_print(f"       Using all-ones fallback mask")
