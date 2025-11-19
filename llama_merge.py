@@ -404,13 +404,13 @@ class LLaMAMerger:
                 k = int(importance.numel() * self.density)
                 flat_importance = importance.flatten()
                 topk_indices = torch.topk(flat_importance, k).indices
-                
+
                 # Store ONLY the indices of important weights (not the full mask)
                 # This reduces storage from ~14GB to ~100MB per model!
                 importance_masks[layer_name] = {
-                    'indices': topk_indices.cpu(),
-                    'shape': importance.shape,
-                    'density': self.density
+                    "indices": topk_indices.cpu(),
+                    "shape": importance.shape,
+                    "density": self.density,
                 }
 
             log_print(f"  ✓ Generated masks for {len(importance_masks)} layers")
@@ -423,13 +423,19 @@ class LLaMAMerger:
             mask_size_mb = (
                 mask_file.stat().st_size / (1024**2) if mask_file.exists() else 0
             )
-            
+
             # Estimate full dense mask size: 112 layers * avg weight shape * 4 bytes/float32
             # For LLaMA 1B: ~45M parameters in linear layers → ~180MB per model as dense mask
             estimated_dense_mb = 180  # Conservative estimate
-            savings_pct = (1 - mask_size_mb / estimated_dense_mb) * 100 if estimated_dense_mb > 0 else 0
-            
-            log_print(f"  ✓ Saved {mask_size_mb:.1f}MB (vs ~{estimated_dense_mb}MB dense, {savings_pct:.1f}% savings!)")
+            savings_pct = (
+                (1 - mask_size_mb / estimated_dense_mb) * 100
+                if estimated_dense_mb > 0
+                else 0
+            )
+
+            log_print(
+                f"  ✓ Saved {mask_size_mb:.1f}MB (vs ~{estimated_dense_mb}MB dense, {savings_pct:.1f}% savings!)"
+            )
 
             # Free memory
             log_print(f"  Cleaning up memory...")
@@ -1038,25 +1044,28 @@ class LLaMAMerger:
                     if full_key:
                         # Reconstruct mask from stored indices
                         mask_data = mask_dict[full_key]
-                        
+
                         # Check if it's the new format (dict with indices)
-                        if isinstance(mask_data, dict) and 'indices' in mask_data:
+                        if isinstance(mask_data, dict) and "indices" in mask_data:
                             # New format: reconstruct mask from indices
-                            indices = mask_data['indices']
-                            shape = mask_data['shape']
-                            
+                            indices = mask_data["indices"]
+                            shape = mask_data["shape"]
+
                             # Create mask: True at important indices, False elsewhere
-                            flat_mask = torch.zeros(shape[0] * shape[1], dtype=torch.float32)
+                            flat_mask = torch.zeros(
+                                shape[0] * shape[1], dtype=torch.float32
+                            )
                             flat_mask[indices] = 1.0
                             dense_mask = flat_mask.reshape(shape)
                         else:
                             # Old format: sparse tensor or dense mask
                             dense_mask = (
                                 mask_data.to_dense()
-                                if hasattr(mask_data, 'to_dense') and mask_data.is_sparse
+                                if hasattr(mask_data, "to_dense")
+                                and mask_data.is_sparse
                                 else mask_data
                             )
-                        
+
                         # Convert to float and move to correct device
                         # IMPORTANT: Must be float type for multiplication, not bool
                         importance_masks.append(
@@ -1221,25 +1230,28 @@ class LLaMAMerger:
                     if full_key:
                         # Reconstruct mask from stored indices
                         mask_data = mask_dict[full_key]
-                        
+
                         # Check if it's the new format (dict with indices)
-                        if isinstance(mask_data, dict) and 'indices' in mask_data:
+                        if isinstance(mask_data, dict) and "indices" in mask_data:
                             # New format: reconstruct mask from indices
-                            indices = mask_data['indices']
-                            shape = mask_data['shape']
-                            
+                            indices = mask_data["indices"]
+                            shape = mask_data["shape"]
+
                             # Create mask: True at important indices, False elsewhere
-                            flat_mask = torch.zeros(shape[0] * shape[1], dtype=torch.float32)
+                            flat_mask = torch.zeros(
+                                shape[0] * shape[1], dtype=torch.float32
+                            )
                             flat_mask[indices] = 1.0
                             dense_mask = flat_mask.reshape(shape)
                         else:
                             # Old format: sparse tensor or dense mask
                             dense_mask = (
                                 mask_data.to_dense()
-                                if hasattr(mask_data, 'to_dense') and mask_data.is_sparse
+                                if hasattr(mask_data, "to_dense")
+                                and mask_data.is_sparse
                                 else mask_data
                             )
-                        
+
                         # Convert to float and move to correct device
                         importance_masks.append(
                             dense_mask.to(dtype=torch.float32, device=model_device)
