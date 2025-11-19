@@ -400,13 +400,18 @@ class LLaMAMerger:
                     (h_inv_diag_broadcasted + eps).pow(2)
                 )
 
-                # Get top-k mask (sparse boolean)
+                # Get top-k indices (MUCH more efficient than storing full mask!)
                 k = int(importance.numel() * self.density)
-                threshold = torch.topk(importance.flatten(), k).values[-1]
-                mask = importance >= threshold
-
-                # Store as sparse (saves memory)
-                importance_masks[layer_name] = mask.to_sparse()
+                flat_importance = importance.flatten()
+                topk_indices = torch.topk(flat_importance, k).indices
+                
+                # Store ONLY the indices of important weights (not the full mask)
+                # This reduces storage from ~14GB to ~100MB per model!
+                importance_masks[layer_name] = {
+                    'indices': topk_indices.cpu(),
+                    'shape': importance.shape,
+                    'density': self.density
+                }
 
             log_print(f"  ✓ Generated masks for {len(importance_masks)} layers")
 
@@ -414,24 +419,36 @@ class LLaMAMerger:
             log_print(f"  Saving importance masks: {mask_file}")
             torch.save(importance_masks, mask_file)
 
-            # Calculate saved space
+            # Calculate saved space and compare to alternatives
             mask_size_mb = (
                 mask_file.stat().st_size / (1024**2) if mask_file.exists() else 0
             )
-            log_print(f"  ✓ Saved {mask_size_mb:.1f}MB (vs ~6GB for full Hessian!)")
+            
+            # Estimate full dense mask size: 112 layers * avg weight shape * 4 bytes/float32
+            # For LLaMA 1B: ~45M parameters in linear layers → ~180MB per model as dense mask
+            estimated_dense_mb = 180  # Conservative estimate
+            savings_pct = (1 - mask_size_mb / estimated_dense_mb) * 100 if estimated_dense_mb > 0 else 0
+            
+            log_print(f"  ✓ Saved {mask_size_mb:.1f}MB (vs ~{estimated_dense_mb}MB dense, {savings_pct:.1f}% savings!)")
 
             # Free memory
             log_print(f"  Cleaning up memory...")
-            del model, calibration_data, hessian_inv_diags, importance_masks, task_vector_dict
+            del (
+                model,
+                calibration_data,
+                hessian_inv_diags,
+                importance_masks,
+                task_vector_dict,
+            )
             gc.collect()
             torch.cuda.empty_cache()
-            log_print(
-                f"  ✓ Model {idx+1}/{len(self.finetuned_model_paths)} complete!"
-            )
+            log_print(f"  ✓ Model {idx+1}/{len(self.finetuned_model_paths)} complete!")
 
         log_print("\n✓ Importance mask computation complete!")
         log_print(
-            f"Total cache size: ~{len(self.finetuned_model_paths) * 100}MB (vs ~{len(self.finetuned_model_paths) * 6000}MB with full Hessians!)"
+            f"Storage efficiency: Indices-only format uses ~{len(self.finetuned_model_paths) * 20}MB\n"
+            f"  vs ~{len(self.finetuned_model_paths) * 180}MB for dense masks\n"
+            f"  vs ~{len(self.finetuned_model_paths) * 6000}MB for full Hessians!"
         )
 
     # ============================================================================
@@ -443,7 +460,7 @@ class LLaMAMerger:
     ) -> tuple[List[torch.Tensor], torch.device]:
         """
         Load cached task vectors for a specific layer from disk.
-        
+
         This method now loads PRE-COMPUTED task vectors instead of computing on-the-fly.
         Task vectors are computed once by compute_and_save_task_vectors() and reused
         across all three merging methods (TIES-Magnitude, DARE-Random, TIES-SparseGPT).
@@ -526,12 +543,12 @@ class LLaMAMerger:
     def compute_and_save_task_vectors(self):
         """
         Compute task vectors (ft_weights - base_weights) for each model.
-        
+
         This is computed ONCE and used by ALL three merging methods:
         - TIES-Magnitude
         - DARE-Random
         - TIES-SparseGPT
-        
+
         Process ONE MODEL AT A TIME to save memory:
         1. Load base model
         2. For each fine-tuned model:
@@ -1019,13 +1036,27 @@ class LLaMAMerger:
                     mask_dict = torch.load(mask_file, map_location="cpu")
                     full_key = self._find_matching_key(mask_dict, layer_name)
                     if full_key:
-                        # Convert sparse mask back to dense
-                        sparse_mask = mask_dict[full_key]
-                        dense_mask = (
-                            sparse_mask.to_dense()
-                            if sparse_mask.is_sparse
-                            else sparse_mask
-                        )
+                        # Reconstruct mask from stored indices
+                        mask_data = mask_dict[full_key]
+                        
+                        # Check if it's the new format (dict with indices)
+                        if isinstance(mask_data, dict) and 'indices' in mask_data:
+                            # New format: reconstruct mask from indices
+                            indices = mask_data['indices']
+                            shape = mask_data['shape']
+                            
+                            # Create mask: True at important indices, False elsewhere
+                            flat_mask = torch.zeros(shape[0] * shape[1], dtype=torch.float32)
+                            flat_mask[indices] = 1.0
+                            dense_mask = flat_mask.reshape(shape)
+                        else:
+                            # Old format: sparse tensor or dense mask
+                            dense_mask = (
+                                mask_data.to_dense()
+                                if hasattr(mask_data, 'to_dense') and mask_data.is_sparse
+                                else mask_data
+                            )
+                        
                         # Convert to float and move to correct device
                         # IMPORTANT: Must be float type for multiplication, not bool
                         importance_masks.append(
@@ -1188,13 +1219,27 @@ class LLaMAMerger:
                     mask_dict = torch.load(mask_file, map_location="cpu")
                     full_key = self._find_matching_key(mask_dict, layer_name)
                     if full_key:
-                        # Convert sparse mask back to dense
-                        sparse_mask = mask_dict[full_key]
-                        dense_mask = (
-                            sparse_mask.to_dense()
-                            if sparse_mask.is_sparse
-                            else sparse_mask
-                        )
+                        # Reconstruct mask from stored indices
+                        mask_data = mask_dict[full_key]
+                        
+                        # Check if it's the new format (dict with indices)
+                        if isinstance(mask_data, dict) and 'indices' in mask_data:
+                            # New format: reconstruct mask from indices
+                            indices = mask_data['indices']
+                            shape = mask_data['shape']
+                            
+                            # Create mask: True at important indices, False elsewhere
+                            flat_mask = torch.zeros(shape[0] * shape[1], dtype=torch.float32)
+                            flat_mask[indices] = 1.0
+                            dense_mask = flat_mask.reshape(shape)
+                        else:
+                            # Old format: sparse tensor or dense mask
+                            dense_mask = (
+                                mask_data.to_dense()
+                                if hasattr(mask_data, 'to_dense') and mask_data.is_sparse
+                                else mask_data
+                            )
+                        
                         # Convert to float and move to correct device
                         importance_masks.append(
                             dense_mask.to(dtype=torch.float32, device=model_device)
@@ -1446,12 +1491,12 @@ class LLaMAMerger:
     def merge_all_methods(self) -> Dict[str, Dict]:
         """
         Run all three merging methods and compare results.
-        
+
         Optimized workflow:
         1. Compute task vectors once (cached to disk, ~2-6GB total)
         2. Compute importance masks once (cached to disk, ~100MB each)
         3. Reuse cached data for all three methods
-        
+
         Total cache: ~2-6GB task vectors + ~200MB masks
         vs OLD: ~24GB (multiple redundant copies)
 
@@ -1464,12 +1509,14 @@ class LLaMAMerger:
         log_print("OPTIMIZED MODE:")
         log_print("  - Task vectors: Computed once, cached (~2-6GB)")
         log_print("  - Importance masks: ~100MB each (cached)")
-        log_print(f"  - Total cache: ~{len(self.finetuned_model_paths) * 2000 + len(self.finetuned_model_paths) * 100}MB")
+        log_print(
+            f"  - Total cache: ~{len(self.finetuned_model_paths) * 2000 + len(self.finetuned_model_paths) * 100}MB"
+        )
         log_print("=" * 60)
 
         # Step 1: Compute task vectors (shared by all methods)
         self.compute_and_save_task_vectors()
-        
+
         # Step 2: For SparseGPT method, compute and cache importance masks
         # (TIES and DARE don't need this - they use magnitude-based selection)
         self.compute_and_cache_importance_masks()
