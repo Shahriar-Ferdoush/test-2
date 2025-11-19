@@ -905,27 +905,29 @@ class LLaMAMerger:
         # Instead of accumulating all activations, process in chunks of BATCH_SIZE
         BATCH_SIZE = 16  # Process 16 samples at a time to avoid OOM
         num_batches = (len(calibration_data) + BATCH_SIZE - 1) // BATCH_SIZE
-        
+
         log_print(
             f"    Computing Hessians with {len(calibration_data)} samples in {num_batches} batches of {BATCH_SIZE}..."
         )
         log_print(f"    This prevents memory overflow by processing incrementally.")
-        
+
         # Initialize Hessian calculators for all layers
         hessian_calcs = {}
         for name, layer in linear_layers.items():
             weight_shape = layer.weight.shape
-            hessian_calcs[name] = HessianCalculator(weight_shape, device=torch.device("cpu"))
-        
+            hessian_calcs[name] = HessianCalculator(
+                weight_shape, device=torch.device("cpu")
+            )
+
         forward_device = getattr(self, "_current_device", self.device)
         start_time = time.time()
-        
+
         # Process calibration data in batches
         for batch_idx in range(num_batches):
             batch_start = batch_idx * BATCH_SIZE
             batch_end = min(batch_start + BATCH_SIZE, len(calibration_data))
             batch_samples = calibration_data[batch_start:batch_end]
-            
+
             if (batch_idx + 1) % 5 == 0 or batch_idx == 0:
                 elapsed = time.time() - start_time
                 rate = (batch_idx + 1) / elapsed if elapsed > 0 else 0
@@ -934,7 +936,7 @@ class LLaMAMerger:
                 log_print(
                     f"      Batch {batch_idx+1}/{num_batches} ({samples_done}/{len(calibration_data)} samples) | ETA: {eta:.0f}s"
                 )
-            
+
             # Collect activations for this batch only
             activations = {name: [] for name in linear_layers.keys()}
             hooks = []
@@ -943,6 +945,7 @@ class LLaMAMerger:
                 def hook(module, inp, out):
                     # Save input activations (detach and keep on CPU to save GPU memory)
                     activations[name].append(inp[0].detach().cpu())
+
                 return hook
 
             # Register hooks
@@ -965,22 +968,24 @@ class LLaMAMerger:
                             _ = model(sample)
                         else:
                             raise
-            
+
             # Remove hooks
             for hook in hooks:
                 hook.remove()
-            
+
             # Update Hessian calculators with this batch's activations
             for name in linear_layers.keys():
                 if activations[name]:
                     for act in activations[name]:
                         hessian_calcs[name].add_batch(act)
-            
+
             # Clear activations to free memory
             del activations
             torch.cuda.empty_cache()
-        
-        log_print(f"    ✓ Processed all {len(calibration_data)} samples in {time.time()-start_time:.1f}s")
+
+        log_print(
+            f"    ✓ Processed all {len(calibration_data)} samples in {time.time()-start_time:.1f}s"
+        )
 
         # Compute inverse Hessian diagonals from accumulated statistics
         log_print(
@@ -990,7 +995,7 @@ class LLaMAMerger:
         for layer_idx, name in enumerate(linear_layers.keys()):
             if (layer_idx + 1) % 10 == 0 or layer_idx == 0:
                 log_print(f"      Layer {layer_idx+1}/{num_layers}: {name}")
-            
+
             # Compute inverse diagonal
             h_inv_diag = hessian_calcs[name].get_inverse_hessian_diag(percdamp=0.01)
             hessian_inv_diags[name] = h_inv_diag
