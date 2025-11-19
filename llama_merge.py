@@ -901,91 +901,98 @@ class LLaMAMerger:
         """
         hessian_inv_diags = {}
 
-        # Setup hooks to capture activations
-        activations = {name: [] for name in linear_layers.keys()}
-        hooks = []
-
-        def get_activation_hook(name):
-            def hook(module, inp, out):
-                # Save input activations
-                activations[name].append(inp[0].detach().cpu())
-
-            return hook
-
-        # Register hooks
-        for name, layer in linear_layers.items():
-            hooks.append(layer.register_forward_hook(get_activation_hook(name)))
-
-        # Run calibration data through model
+        # MEMORY OPTIMIZATION: Process calibration data in batches
+        # Instead of accumulating all activations, process in chunks of BATCH_SIZE
+        BATCH_SIZE = 16  # Process 16 samples at a time to avoid OOM
+        num_batches = (len(calibration_data) + BATCH_SIZE - 1) // BATCH_SIZE
+        
         log_print(
-            f"    Running {len(calibration_data)} samples through model to capture activations..."
+            f"    Computing Hessians with {len(calibration_data)} samples in {num_batches} batches of {BATCH_SIZE}..."
         )
-        start_time = time.time()
+        log_print(f"    This prevents memory overflow by processing incrementally.")
+        
+        # Initialize Hessian calculators for all layers
+        hessian_calcs = {}
+        for name, layer in linear_layers.items():
+            weight_shape = layer.weight.shape
+            hessian_calcs[name] = HessianCalculator(weight_shape, device=torch.device("cpu"))
+        
         forward_device = getattr(self, "_current_device", self.device)
-        with torch.no_grad():
-            for i, batch in enumerate(calibration_data):
-                if (i + 1) % 10 == 0:
-                    elapsed = time.time() - start_time
-                    rate = (i + 1) / elapsed
-                    eta = (len(calibration_data) - i - 1) / rate if rate > 0 else 0
-                    log_print(
-                        f"      Progress: {i+1}/{len(calibration_data)} samples | Rate: {rate:.1f} samples/s | ETA: {eta:.0f}s"
-                    )
+        start_time = time.time()
+        
+        # Process calibration data in batches
+        for batch_idx in range(num_batches):
+            batch_start = batch_idx * BATCH_SIZE
+            batch_end = min(batch_start + BATCH_SIZE, len(calibration_data))
+            batch_samples = calibration_data[batch_start:batch_end]
+            
+            if (batch_idx + 1) % 5 == 0 or batch_idx == 0:
+                elapsed = time.time() - start_time
+                rate = (batch_idx + 1) / elapsed if elapsed > 0 else 0
+                eta = (num_batches - batch_idx - 1) / rate if rate > 0 else 0
+                samples_done = batch_end
+                log_print(
+                    f"      Batch {batch_idx+1}/{num_batches} ({samples_done}/{len(calibration_data)} samples) | ETA: {eta:.0f}s"
+                )
+            
+            # Collect activations for this batch only
+            activations = {name: [] for name in linear_layers.keys()}
+            hooks = []
 
-                try:
-                    batch = batch.to(forward_device)
-                    _ = model(batch)
-                except RuntimeError as e:
-                    if "out of memory" in str(e).lower() or "cuda" in str(e).lower():
-                        log_print(
-                            f"      ⚠ GPU OOM on batch {i+1}, falling back to CPU"
-                        )
-                        torch.cuda.empty_cache()
-                        forward_device = torch.device("cpu")
-                        model = model.to(forward_device)
-                        batch = batch.to(forward_device)
-                        try:
-                            _ = model(batch)
-                        except Exception as e2:
-                            logger.warning(
-                                f"      Error on batch {i} (CPU fallback): {e2}"
-                            )
-                            continue
-                    else:
-                        logger.warning(f"      Error on batch {i}: {e}")
-                        continue
-                except Exception as e:
-                    logger.warning(f"      Error on batch {i}: {e}")
-                    continue
-        log_print(f"    ✓ Forward pass complete in {time.time()-start_time:.1f}s")
+            def get_activation_hook(name):
+                def hook(module, inp, out):
+                    # Save input activations (detach and keep on CPU to save GPU memory)
+                    activations[name].append(inp[0].detach().cpu())
+                return hook
 
-        # Remove hooks
-        for hook in hooks:
-            hook.remove()
+            # Register hooks
+            for name, layer in linear_layers.items():
+                hooks.append(layer.register_forward_hook(get_activation_hook(name)))
 
-        # Compute Hessians from activations
+            # Forward pass for this batch
+            with torch.no_grad():
+                for sample in batch_samples:
+                    try:
+                        sample = sample.to(forward_device)
+                        _ = model(sample)
+                    except RuntimeError as e:
+                        if "out of memory" in str(e).lower():
+                            log_print(f"        ⚠ GPU OOM, switching to CPU")
+                            torch.cuda.empty_cache()
+                            forward_device = torch.device("cpu")
+                            model = model.to(forward_device)
+                            sample = sample.to(forward_device)
+                            _ = model(sample)
+                        else:
+                            raise
+            
+            # Remove hooks
+            for hook in hooks:
+                hook.remove()
+            
+            # Update Hessian calculators with this batch's activations
+            for name in linear_layers.keys():
+                if activations[name]:
+                    for act in activations[name]:
+                        hessian_calcs[name].add_batch(act)
+            
+            # Clear activations to free memory
+            del activations
+            torch.cuda.empty_cache()
+        
+        log_print(f"    ✓ Processed all {len(calibration_data)} samples in {time.time()-start_time:.1f}s")
+
+        # Compute inverse Hessian diagonals from accumulated statistics
         log_print(
             f"    Computing inverse Hessian diagonals for {len(linear_layers)} layers..."
         )
         num_layers = len(linear_layers)
-        for layer_idx, (name, layer) in enumerate(linear_layers.items()):
+        for layer_idx, name in enumerate(linear_layers.keys()):
             if (layer_idx + 1) % 10 == 0 or layer_idx == 0:
                 log_print(f"      Layer {layer_idx+1}/{num_layers}: {name}")
-
-            if not activations[name]:
-                logger.warning(f"      No activations captured for {name}, skipping")
-                continue
-
-            # Initialize Hessian calculator
-            weight_shape = layer.weight.shape
-            calc = HessianCalculator(weight_shape, device=torch.device("cpu"))
-
-            # Add all activation batches
-            for act in activations[name]:
-                calc.add_batch(act)
-
+            
             # Compute inverse diagonal
-            h_inv_diag = calc.get_inverse_hessian_diag(percdamp=0.01)
+            h_inv_diag = hessian_calcs[name].get_inverse_hessian_diag(percdamp=0.01)
             hessian_inv_diags[name] = h_inv_diag
 
         log_print(f"    ✓ Computed Hessians for {len(hessian_inv_diags)} layers")
