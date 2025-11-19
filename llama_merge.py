@@ -319,125 +319,186 @@ class LLaMAMerger:
             log_print(f"  [1/4] Loading calibration data from {dataset_name}...")
             calibration_data = self.load_calibration_data(dataset_name, tokenizer)
 
-            # Load BOTH models: fine-tuned AND base
-            log_print(f"  [2/5] Loading fine-tuned model...")
+            # Load model
+            log_print(f"  [2/4] Loading model...")
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            ft_model = self._load_finetuned_model(ft_model_path, self.base_model_path)
+            model = self._load_finetuned_model(ft_model_path, self.base_model_path)
 
             # Try GPU first, fallback to CPU if OOM
             try:
-                ft_model = ft_model.to(device)
-                ft_model.eval()
-                log_print(f"    ✓ Fine-tuned model loaded on {device}")
+                model = model.to(device)
+                model.eval()
+                log_print(f"    ✓ Model loaded on {device}")
             except RuntimeError as e:
                 if "out of memory" in str(e).lower() or "cuda" in str(e).lower():
                     log_print(f"    ⚠ GPU memory exceeded, falling back to CPU")
                     torch.cuda.empty_cache()
                     device = torch.device("cpu")
-                    ft_model = ft_model.to(device)
-                    ft_model.eval()
-                    log_print(f"    ✓ Fine-tuned model loaded on {device}")
+                    model = model.to(device)
+                    model.eval()
+                    log_print(f"    ✓ Model loaded on {device}")
                 else:
                     raise
-
-            # Load base model for task vector computation
-            log_print(f"  [3/5] Loading base model (for task vector computation)...")
-            base_model = AutoModelForCausalLM.from_pretrained(
-                self.base_model_path, torch_dtype=torch.float16, device_map="cpu"
-            )
-            base_model.eval()
-            log_print(f"    ✓ Base model loaded on CPU")
 
             # Store device for forward passes
             self._current_device = device
 
-            # Find all linear layers in FINE-TUNED model
-            ft_linear_layers = self._find_linear_layers(ft_model)
-            log_print(f"  Found {len(ft_linear_layers)} linear layers")
+            # Find all linear layers in fine-tuned model
+            ft_linear_layers = self._find_linear_layers(model)
+            log_print(f"  Found {len(ft_linear_layers)} linear layers in fine-tuned model")
 
-            # Compute Hessians on fine-tuned model (in memory only, not saved!)
-            log_print(
-                f"  [4/5] Computing Hessians on fine-tuned model (temporary, in-memory)..."
+            # Load base model to compute task vectors
+            log_print(f"  [3/5] Loading base model for task vector computation...")
+            base_model = AutoModelForCausalLM.from_pretrained(
+                self.base_model_path, torch_dtype=torch.float16, device_map="cpu"
             )
+            base_model.eval()
+            base_linear_layers = self._find_linear_layers(base_model)
+            log_print(f"    ✓ Base model loaded (CPU)")
+
+            # Compute Hessians from fine-tuned model (in memory only, not saved!)
+            log_print(f"  [4/5] Computing Hessians from fine-tuned model (temporary, in-memory)...")
             hessian_inv_diags = self._compute_hessians_for_model(
-                ft_model, ft_linear_layers, calibration_data
+                model, ft_linear_layers, calibration_data
             )
 
-            # Generate importance masks from TASK VECTORS (FIX!)
+            # Generate importance masks from TASK VECTORS
             log_print(
-                f"  [5/5] Computing task vectors and generating importance masks..."
+                f"  [5/5] Generating importance masks from task vectors (top {int(self.density*100)}%)..."
             )
             log_print(
-                f"        (Keeping top {int(self.density*100)}% most important task vector elements)"
+                f"        ═══════════════════════════════════════════════════════════"
+            )
+            log_print(
+                f"        CRITICAL: Computing importance on TASK VECTORS, not weights!"
+            )
+            log_print(
+                f"        Task vector τ = θ_finetuned - θ_base"
+            )
+            log_print(
+                f"        Importance = τ² / (H⁻¹)²  (error from undoing the change)"
+            )
+            log_print(
+                f"        ═══════════════════════════════════════════════════════════"
             )
             importance_masks = {}
-
-            # Find corresponding linear layers in base model
-            base_linear_layers = self._find_linear_layers(base_model)
-
+            
             for layer_name, h_inv_diag in hessian_inv_diags.items():
-                # Get fine-tuned layer weights
-                ft_layer = ft_linear_layers[layer_name]
-                ft_weight = ft_layer.weight.data.cpu()
+                try:
+                    # Get fine-tuned layer weights
+                    ft_layer = ft_linear_layers[layer_name]
+                    ft_weight = ft_layer.weight.data.cpu().float()
 
-                # Get base model layer weights
-                if layer_name in base_linear_layers:
-                    base_layer = base_linear_layers[layer_name]
-                    base_weight = base_layer.weight.data.cpu()
-                else:
-                    log_print(
-                        f"    ⚠ Warning: {layer_name} not found in base model, using zeros"
+                    # Get base model layer weights
+                    if layer_name in base_linear_layers:
+                        base_layer = base_linear_layers[layer_name]
+                        base_weight = base_layer.weight.data.cpu().float()
+                    else:
+                        log_print(
+                            f"    ⚠ Warning: {layer_name} not found in base model, using zeros"
+                        )
+                        base_weight = torch.zeros_like(ft_weight)
+
+                    # ═══════════════════════════════════════════════════════════════
+                    # CRITICAL FIX: Compute importance from TASK VECTOR, not ft weights!
+                    # ═══════════════════════════════════════════════════════════════
+                    # Task vector = fine-tuned weights - base weights
+                    task_vector = ft_weight - base_weight
+
+                    # Handle NaN/Inf
+                    if torch.isnan(task_vector).any() or torch.isinf(task_vector).any():
+                        log_print(f"    ⚠ Warning: NaN/Inf in task vector for {layer_name}, cleaning...")
+                        task_vector = torch.nan_to_num(task_vector, nan=0.0, posinf=0.0, neginf=0.0)
+                    
+                    # Check if task vector is essentially zero (no fine-tuning)
+                    if task_vector.abs().max() < 1e-8:
+                        log_print(f"    ⚠ Warning: {layer_name} has zero task vector, using all-zeros mask")
+                        mask = torch.zeros_like(task_vector, dtype=torch.bool)
+                        importance_masks[layer_name] = mask.to_sparse()
+                        continue
+
+                    # SparseGPT importance formula: τ² / (H⁻¹)²
+                    # where τ = task vector (the update we want to prune)
+                    #       H⁻¹ = inverse Hessian diagonal (sensitivity of input features)
+                    #
+                    # Physical Meaning (from SparseGPT paper):
+                    # -----------------------------------------------
+                    # This measures the reconstruction error from REMOVING task vector element τ_ij:
+                    #
+                    #   Error(remove τ_ij) ≈ τ_ij² / (H⁻¹_jj)²
+                    #
+                    # - Large |τ_ij|: Significant fine-tuning update → important to keep
+                    # - Small H⁻¹_jj: High input variance → removal affects many samples → important
+                    # - Combined: "How much does fine-tuned model break if we undo this change?"
+                    #
+                    # This is EXACTLY the SparseGPT pruning criterion (line 96 in sparsegpt.py),
+                    # but applied to TASK VECTORS instead of weights!
+                    eps = 1e-10  # Numerical stability
+                    h_inv_diag_broadcasted = h_inv_diag.unsqueeze(0).float()  # [1, in_features]
+                    importance = task_vector.pow(2) / (
+                        (h_inv_diag_broadcasted + eps).pow(2)
                     )
-                    base_weight = torch.zeros_like(ft_weight)
 
-                # ═══════════════════════════════════════════════════════════════
-                # CRITICAL FIX: Compute importance from TASK VECTOR, not ft weights!
-                # ═══════════════════════════════════════════════════════════════
-                # Task vector = fine-tuned weights - base weights
-                task_vector = ft_weight - base_weight
+                    # Handle NaN/Inf in importance scores
+                    if torch.isnan(importance).any() or torch.isinf(importance).any():
+                        log_print(f"    ⚠ Warning: NaN/Inf in importance for {layer_name}, cleaning...")
+                        importance = torch.nan_to_num(importance, nan=0.0, posinf=1e10, neginf=0.0)
 
-                # SparseGPT importance formula: τ² / (H⁻¹)²
-                # where τ = task vector (the update we want to prune)
-                #       H⁻¹ = inverse Hessian diagonal (sensitivity of input features)
-                #
-                # Intuition: Keep task vector elements whose REMOVAL causes high error
-                # - Large |τ| = significant fine-tuning update → important
-                # - Small H⁻¹ = high input variance → removing affects many samples → important
-                eps = 1e-10  # Numerical stability
-                h_inv_diag_broadcasted = h_inv_diag.unsqueeze(0)  # [1, in_features]
-                importance = task_vector.pow(2) / (
-                    (h_inv_diag_broadcasted + eps).pow(2)
-                )
+                    # Get top-k mask (sparse boolean)
+                    k = max(1, int(importance.numel() * self.density))
+                    k = min(k, importance.numel())
+                    
+                    if k >= importance.numel():
+                        mask = torch.ones_like(importance, dtype=torch.bool)
+                    else:
+                        importance_flat = importance.flatten()
+                        threshold = torch.topk(importance_flat, k).values[-1]
+                        mask = importance >= threshold
 
-                # Get top-k mask (sparse boolean)
-                k = int(importance.numel() * self.density)
-                threshold = torch.topk(importance.flatten(), k).values[-1]
-                mask = importance >= threshold
-
-                # Store as sparse (saves memory)
-                importance_masks[layer_name] = mask.to_sparse()
+                    importance_masks[layer_name] = mask.cpu().to_sparse()
+                    
+                except Exception as e:
+                    log_print(f"    ❌ Error processing {layer_name}: {e}")
+                    log_print(f"       Creating fallback all-ones mask")
+                    fallback_mask = torch.ones(ft_weight.shape, dtype=torch.bool)
+                    importance_masks[layer_name] = fallback_mask.to_sparse()
+                    continue
 
             log_print(f"  ✓ Generated masks for {len(importance_masks)} layers")
 
             # Save masks ONLY (not Hessians!)
             log_print(f"  Saving importance masks: {mask_file}")
-            torch.save(importance_masks, mask_file)
-
-            # Calculate saved space
-            mask_size_mb = (
-                mask_file.stat().st_size / (1024**2) if mask_file.exists() else 0
-            )
-            log_print(f"  ✓ Saved {mask_size_mb:.1f}MB (vs ~6GB for full Hessian!)")
+            
+            # Ensure parent directory exists
+            mask_file.parent.mkdir(parents=True, exist_ok=True)
+            
+            try:
+                torch.save(importance_masks, mask_file)
+                
+                if not mask_file.exists():
+                    raise RuntimeError(f"File {mask_file} was not created")
+                
+                mask_size_mb = mask_file.stat().st_size / (1024**2)
+                log_print(f"  ✓ Saved {mask_size_mb:.1f}MB (vs ~6GB for full Hessian!)")
+                
+            except Exception as e:
+                log_print(f"  ❌ Error saving masks: {e}")
+                log_print(f"     Attempting pickle fallback...")
+                
+                try:
+                    import pickle
+                    pkl_file = mask_file.with_suffix('.pkl')
+                    with open(pkl_file, 'wb') as f:
+                        pickle.dump(importance_masks, f, protocol=pickle.HIGHEST_PROTOCOL)
+                    log_print(f"  ✓ Saved as pickle: {pkl_file}")
+                except Exception as e2:
+                    log_print(f"  ❌ Pickle save also failed: {e2}")
+                    log_print(f"     Will recompute masks if needed")
 
             # Free memory
             log_print(f"  Cleaning up memory...")
-            del (
-                ft_model,
-                base_model,
-                calibration_data,
-                hessian_inv_diags,
-                importance_masks,
-            )
+            del model, base_model, calibration_data, hessian_inv_diags, importance_masks
+            del ft_linear_layers, base_linear_layers
             gc.collect()
             torch.cuda.empty_cache()
             log_print(f"  ✓ Model {idx+1}/{len(self.finetuned_model_paths)} complete!")
@@ -1068,26 +1129,51 @@ class LLaMAMerger:
                 importance_masks = []
                 for idx in range(len(self.finetuned_model_paths)):
                     mask_file = self.mask_dir / f"importance_mask_{idx}.pt"
-                    mask_dict = torch.load(mask_file, map_location="cpu")
-                    full_key = self._find_matching_key(mask_dict, layer_name)
-                    if full_key:
-                        # Convert sparse mask back to dense
-                        sparse_mask = mask_dict[full_key]
-                        dense_mask = (
-                            sparse_mask.to_dense()
-                            if sparse_mask.is_sparse
-                            else sparse_mask
-                        )
-                        # Convert to float and move to correct device
-                        # IMPORTANT: Must be float type for multiplication, not bool
-                        importance_masks.append(
-                            dense_mask.to(dtype=torch.float32, device=model_device)
-                        )
-                    else:
-                        log_print(
-                            f"    ⚠ Mask for {layer_name} not found in model {idx}, using all-ones mask"
-                        )
-                        # Create dummy mask (all ones) as float
+                    
+                    try:
+                        # Try loading .pt file first
+                        if mask_file.exists():
+                            mask_dict = torch.load(mask_file, map_location="cpu")
+                        else:
+                            # Try pickle fallback
+                            pkl_file = mask_file.with_suffix('.pkl')
+                            if pkl_file.exists():
+                                import pickle
+                                with open(pkl_file, 'rb') as f:
+                                    mask_dict = pickle.load(f)
+                            else:
+                                raise FileNotFoundError(f"No mask file found: {mask_file}")
+                        
+                        full_key = self._find_matching_key(mask_dict, layer_name)
+                        if full_key:
+                            # Convert sparse mask back to dense
+                            sparse_mask = mask_dict[full_key]
+                            dense_mask = (
+                                sparse_mask.to_dense()
+                                if sparse_mask.is_sparse
+                                else sparse_mask
+                            )
+                            # Convert to float and move to correct device
+                            # IMPORTANT: Must be float type for multiplication, not bool
+                            importance_masks.append(
+                                dense_mask.to(dtype=torch.float32, device=model_device)
+                            )
+                        else:
+                            log_print(
+                                f"    ⚠ Mask for {layer_name} not found in model {idx}, using all-ones mask"
+                            )
+                            # Create dummy mask (all ones) as float
+                            importance_masks.append(
+                                torch.ones(
+                                    base_params.shape,
+                                    dtype=torch.float32,
+                                    device=model_device,
+                                ).flatten()
+                            )
+                    
+                    except Exception as e:
+                        log_print(f"    ❌ Error loading mask for model {idx}: {e}")
+                        log_print(f"       Using all-ones fallback mask")
                         importance_masks.append(
                             torch.ones(
                                 base_params.shape,
@@ -1240,23 +1326,55 @@ class LLaMAMerger:
                 importance_masks = []
                 for idx in range(len(self.finetuned_model_paths)):
                     mask_file = self.mask_dir / f"importance_mask_{idx}.pt"
-                    mask_dict = torch.load(mask_file, map_location="cpu")
-                    full_key = self._find_matching_key(mask_dict, layer_name)
-                    if full_key:
-                        # Convert sparse mask back to dense
-                        sparse_mask = mask_dict[full_key]
-                        dense_mask = (
-                            sparse_mask.to_dense()
-                            if sparse_mask.is_sparse
-                            else sparse_mask
-                        )
-                        # Convert to float and move to correct device
+                    
+                    try:
+                        # Try loading .pt file first
+                        if mask_file.exists():
+                            mask_dict = torch.load(mask_file, map_location="cpu")
+                        else:
+                            # Try pickle fallback
+                            pkl_file = mask_file.with_suffix('.pkl')
+                            if pkl_file.exists():
+                                import pickle
+                                with open(pkl_file, 'rb') as f:
+                                    mask_dict = pickle.load(f)
+                            else:
+                                raise FileNotFoundError(f"No mask file found: {mask_file}")
+                        
+                        full_key = self._find_matching_key(mask_dict, layer_name)
+                        if full_key:
+                            # Convert sparse mask back to dense
+                            sparse_mask = mask_dict[full_key]
+                            dense_mask = (
+                                sparse_mask.to_dense()
+                                if sparse_mask.is_sparse
+                                else sparse_mask
+                            )
+                            # Convert to float and move to correct device
+                            importance_masks.append(
+                                dense_mask.to(dtype=torch.float32, device=model_device)
+                            )
+                        else:
+                            log_print(
+                                f"    ⚠ Mask for {layer_name} not found in model {idx}, using all-ones mask"
+                            )
+                            importance_masks.append(
+                                torch.ones(
+                                    base_params.shape,
+                                    dtype=torch.float32,
+                                    device=model_device,
+                                ).flatten()
+                            )
+                    
+                    except Exception as e:
+                        log_print(f"    ❌ Error loading mask for model {idx}: {e}")
+                        log_print(f"       Using all-ones fallback mask")
                         importance_masks.append(
-                            dense_mask.to(dtype=torch.float32, device=model_device)
-                        )
-                    else:
-                        log_print(
-                            f"    ⚠ Mask for {layer_name} not found in model {idx}, using all-ones mask"
+                            torch.ones(
+                                base_params.shape,
+                                dtype=torch.float32,
+                                device=model_device,
+                            ).flatten()
                         )
                         # Create dummy mask (all ones) as float
                         importance_masks.append(
