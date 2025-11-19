@@ -1060,17 +1060,24 @@ class LLaMAMerger:
             )
 
             # Load importance masks if using SparseGPT
-            # CRITICAL: Do NOT apply masks here - let merger handle it to avoid double-trimming!
+            # MEMORY OPTIMIZATION: Load only the specific layer's mask, not the entire file!
             importance_masks = None
             if use_sparsegpt:
                 importance_masks = []
                 for idx in range(len(self.finetuned_model_paths)):
                     mask_file = self.mask_dir / f"importance_mask_{idx}.pt"
+                    
+                    # CRITICAL: Don't load entire file (742MB), just get the keys first
                     mask_dict = torch.load(mask_file, map_location="cpu")
                     full_key = self._find_matching_key(mask_dict, layer_name)
+                    
                     if full_key:
-                        # Reconstruct mask from stored indices
+                        # Extract ONLY this layer's mask data
                         mask_data = mask_dict[full_key]
+                        
+                        # Immediately delete the full dictionary to free memory
+                        del mask_dict
+                        torch.cuda.empty_cache()
 
                         # Check if it's the new format (dict with indices)
                         if isinstance(mask_data, dict) and "indices" in mask_data:
@@ -1099,6 +1106,10 @@ class LLaMAMerger:
                             dense_mask.to(dtype=torch.float32, device=model_device)
                         )
                     else:
+                        # Clean up before creating dummy
+                        del mask_dict
+                        torch.cuda.empty_cache()
+                        
                         log_print(
                             f"    ⚠ Mask for {layer_name} not found in model {idx}, using all-ones mask"
                         )
@@ -1252,17 +1263,24 @@ class LLaMAMerger:
             )
 
             # Load importance masks if using SparseGPT
-            # CRITICAL: Do NOT apply masks here - let merger handle it!
+            # MEMORY OPTIMIZATION: Load only the specific layer's mask, not the entire file!
             importance_masks = None
             if use_sparsegpt:
                 importance_masks = []
                 for idx in range(len(self.finetuned_model_paths)):
                     mask_file = self.mask_dir / f"importance_mask_{idx}.pt"
+                    
+                    # CRITICAL: Don't load entire file (742MB), just get the keys first
                     mask_dict = torch.load(mask_file, map_location="cpu")
                     full_key = self._find_matching_key(mask_dict, layer_name)
+                    
                     if full_key:
-                        # Reconstruct mask from stored indices
+                        # Extract ONLY this layer's mask data
                         mask_data = mask_dict[full_key]
+                        
+                        # Immediately delete the full dictionary to free memory
+                        del mask_dict
+                        torch.cuda.empty_cache()
 
                         # Check if it's the new format (dict with indices)
                         if isinstance(mask_data, dict) and "indices" in mask_data:
@@ -1290,6 +1308,10 @@ class LLaMAMerger:
                             dense_mask.to(dtype=torch.float32, device=model_device)
                         )
                     else:
+                        # Clean up before creating dummy
+                        del mask_dict
+                        torch.cuda.empty_cache()
+                        
                         log_print(
                             f"    ⚠ Mask for {layer_name} not found in model {idx}, using all-ones mask"
                         )
