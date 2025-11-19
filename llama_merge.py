@@ -130,6 +130,8 @@ class LLaMAMerger:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
         # Cache subdirectories
+        # NOTE: Task vectors are temporary (deleted after mask generation)
+        # Only importance masks are kept long-term (~20MB per model)
         self.task_vector_dir = self.cache_dir / "task_vectors"
         self.task_vector_dir.mkdir(exist_ok=True)
 
@@ -139,7 +141,8 @@ class LLaMAMerger:
         log_print(f"Initialized LLaMAMerger with {len(finetuned_model_paths)} models")
         log_print(f"Device: {self.device}")
         log_print(f"Density: {self.density} (keep {self.density*100}% of weights)")
-        log_print(f"Cache strategy: Task vectors + importance masks")
+        log_print(f"Memory-efficient: Task vectors cached temporarily, deleted after use")
+        log_print(f"Final cache size: ~{len(finetuned_model_paths) * 20}MB (masks only)")
 
     # ============================================================================
     # STORAGE-OPTIMIZED APPROACH
@@ -458,64 +461,66 @@ class LLaMAMerger:
         )
 
     # ============================================================================
-    # HELPER: Load Cached Task Vectors
+    # HELPER: Compute Task Vectors On-The-Fly (Fast, Memory-Efficient)
     # ============================================================================
 
     def _compute_task_vectors_for_layer(
         self, layer_name: str
     ) -> tuple[List[torch.Tensor], torch.device]:
         """
-        Load cached task vectors for a specific layer from disk.
-
-        This method now loads PRE-COMPUTED task vectors instead of computing on-the-fly.
-        Task vectors are computed once by compute_and_save_task_vectors() and reused
-        across all three merging methods (TIES-Magnitude, DARE-Random, TIES-SparseGPT).
+        Compute task vectors for a specific layer on-the-fly using cached models.
+        
+        IMPORTANT: This loads models into memory ONCE and reuses them for all layers.
+        This is MUCH faster than loading task vectors from disk 112 times!
+        
+        Performance comparison:
+        - Load from disk per layer: 112 layers × 2GB file × 2 models = 224 slow I/O ops
+        - Load models once, compute on-fly: 2 model loads + 112 fast in-memory computations
+        
+        The task vector CACHING is still useful for the importance mask computation,
+        but during merging it's faster to keep models in RAM and compute deltas.
 
         Args:
-            layer_name: Name of the layer to load task vectors for
+            layer_name: Name of the layer to compute task vectors for
 
         Returns:
             Tuple of (task_vectors, device)
         """
-        # Load task vectors from cache
+        # Load models into cache on first call (ONCE for all layers)
+        if not hasattr(self, "_base_model_cache"):
+            log_print("\n[OPTIMIZATION] Loading models into memory (one-time cost)...")
+            log_print("  This is faster than loading task vectors from disk 112 times!")
+            log_print("  Loading base model...")
+            self._base_model_cache = AutoModelForCausalLM.from_pretrained(
+                self.base_model_path, torch_dtype=torch.float16, device_map="cpu"
+            )
+
+            log_print(f"  Loading {len(self.finetuned_model_paths)} fine-tuned models...")
+            self._ft_models_cache = []
+            for i, ft_path in enumerate(self.finetuned_model_paths):
+                ft_model = self._load_finetuned_model(ft_path, self.base_model_path)
+                self._ft_models_cache.append(ft_model)
+                log_print(f"    [{i+1}/{len(self.finetuned_model_paths)}] Loaded {ft_path.split('/')[-1]}")
+
+            log_print("  ✓ All models cached in memory\n")
+
+            # Determine device
+            self._model_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        # Get base layer parameters
+        base_params = self._get_layer_params(self._base_model_cache, layer_name)
+
+        # Compute task vector for each fine-tuned model
         task_vectors = []
+        for ft_model in self._ft_models_cache:
+            ft_params = self._get_layer_params(ft_model, layer_name)
 
-        for idx in range(len(self.finetuned_model_paths)):
-            task_vector_file = self.task_vector_dir / f"task_vector_{idx}.pt"
+            # Compute task vector: τ = θ_ft - θ_base
+            # Ensure both are on same device
+            task_vector = ft_params.to(base_params.device) - base_params
+            task_vectors.append(task_vector)
 
-            if not task_vector_file.exists():
-                raise FileNotFoundError(
-                    f"Task vector cache not found: {task_vector_file}\\n"
-                    f"Please run compute_and_save_task_vectors() first!"
-                )
-
-            # Load cached task vectors for this model
-            task_vector_dict = torch.load(task_vector_file, map_location="cpu")
-
-            # Find the matching key for this layer
-            # Handle both exact matches and partial matches (e.g., with/without .weight)
-            layer_key = None
-            for key in task_vector_dict.keys():
-                if layer_name in key or key in layer_name:
-                    layer_key = key
-                    break
-
-            if layer_key is None:
-                # Try adding .weight suffix
-                if f"{layer_name}.weight" in task_vector_dict:
-                    layer_key = f"{layer_name}.weight"
-                else:
-                    raise KeyError(
-                        f"Layer '{layer_name}' not found in cached task vectors for model {idx}.\\n"
-                        f"Available keys: {list(task_vector_dict.keys())[:10]}..."
-                    )
-
-            task_vectors.append(task_vector_dict[layer_key])
-
-        # Determine device
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-        return task_vectors, device
+        return task_vectors, self._model_device
 
     def _load_lora_merged_model(
         self, lora_path: str, layer_name: str = None
@@ -1161,10 +1166,16 @@ class LLaMAMerger:
     def _clear_base_model_cache(self):
         """
         Clear cached base and ft models to free memory.
-        NOTE: This is now a no-op since we use disk-cached task vectors instead.
-        Kept for backward compatibility.
+        Called after each merging method completes.
         """
-        pass  # Task vectors loaded from disk, no models cached in memory
+        if hasattr(self, "_base_model_cache"):
+            del self._base_model_cache
+        if hasattr(self, "_ft_models_cache"):
+            del self._ft_models_cache
+        if hasattr(self, "_model_device"):
+            del self._model_device
+        gc.collect()
+        torch.cuda.empty_cache()
 
     def merge_with_dare(self, use_sparsegpt: bool = False) -> AutoModelForCausalLM:
         """
@@ -1504,13 +1515,16 @@ class LLaMAMerger:
         """
         Run all three merging methods and compare results.
 
-        Optimized workflow:
-        1. Compute task vectors once (cached to disk, ~2-6GB total)
-        2. Compute importance masks once (cached to disk, ~100MB each)
-        3. Reuse cached data for all three methods
+        Hybrid optimization strategy:
+        1. Compute task vectors once, cache to disk (~2-6GB total)
+           - Used ONLY for importance mask generation (1x disk read)
+        2. During merging: Load models into RAM, compute task vectors on-the-fly
+           - Much faster than 112 disk reads per model!
+        3. Importance masks cached to disk (~20MB each, indices-only)
 
-        Total cache: ~2-6GB task vectors + ~200MB masks
-        vs OLD: ~24GB (multiple redundant copies)
+        Why this hybrid approach?
+        - Importance masks: Need full task vectors once → cache to disk
+        - Merging (TIES/DARE): Need per-layer task vectors 112 times → keep models in RAM
 
         Returns:
             Dictionary with results for each method
@@ -1518,20 +1532,30 @@ class LLaMAMerger:
         log_print("\n" + "=" * 60)
         log_print("COMPREHENSIVE MODEL MERGING COMPARISON")
         log_print("=" * 60)
-        log_print("OPTIMIZED MODE:")
-        log_print("  - Task vectors: Computed once, cached (~2-6GB)")
-        log_print("  - Importance masks: ~100MB each (cached)")
-        log_print(
-            f"  - Total cache: ~{len(self.finetuned_model_paths) * 2000 + len(self.finetuned_model_paths) * 100}MB"
-        )
+        log_print("MEMORY-EFFICIENT MODE:")
+        log_print("  - Task vectors: Temporarily cached, deleted after mask generation")
+        log_print("  - Importance masks: ~20MB each (indices-only, kept)")
+        log_print("  - Models loaded on-demand during merging")
+        log_print(f"  - Peak disk usage: ~{len(self.finetuned_model_paths) * 2000}MB (temporary)")
+        log_print(f"  - Final disk cache: ~{len(self.finetuned_model_paths) * 20}MB (masks only)")
         log_print("=" * 60)
 
-        # Step 1: Compute task vectors (shared by all methods)
+        # Step 1: Compute task vectors (temporary, for mask generation)
         self.compute_and_save_task_vectors()
 
-        # Step 2: For SparseGPT method, compute and cache importance masks
-        # (TIES and DARE don't need this - they use magnitude-based selection)
+        # Step 2: Compute importance masks using cached task vectors
         self.compute_and_cache_importance_masks()
+        
+        # Step 3: DELETE task vectors to free disk space (we only need masks now!)
+        log_print("\n[CLEANUP] Removing temporary task vector cache to save disk space...")
+        for idx in range(len(self.finetuned_model_paths)):
+            task_vector_file = self.task_vector_dir / f"task_vector_{idx}.pt"
+            if task_vector_file.exists():
+                file_size_mb = task_vector_file.stat().st_size / (1024**2)
+                task_vector_file.unlink()
+                log_print(f"  ✓ Deleted task_vector_{idx}.pt ({file_size_mb:.1f}MB)")
+        log_print(f"  ✓ Freed ~{len(self.finetuned_model_paths) * 2000}MB disk space!")
+        log_print(f"  Final cache: ~{len(self.finetuned_model_paths) * 20}MB (importance masks only)\n")
 
         # Load tokenizer for evaluation
         tokenizer = AutoTokenizer.from_pretrained(self.base_model_path)
