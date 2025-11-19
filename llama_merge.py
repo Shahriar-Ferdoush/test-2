@@ -277,9 +277,9 @@ class LLaMAMerger:
         5. Delete everything, move to next model
         """
         log_print("=" * 60)
-        log_print("STEP 1: Computing Importance Masks (SparseGPT)")
+        log_print("STEP 2: Computing Importance Masks (SparseGPT)")
         log_print("=" * 60)
-        log_print("Note: Computing on-the-fly, caching only masks to save space")
+        log_print("Note: Using cached task vectors, computing importance on-the-fly")
 
         # CRITICAL WARNING: Check calibration sample count
         if self.num_calibration_samples < 64:
@@ -299,16 +299,6 @@ class LLaMAMerger:
         tokenizer = AutoTokenizer.from_pretrained(self.base_model_path)
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
-
-        # CRITICAL FIX: Load base model ONCE to compute task vectors
-        # Importance must be calculated on task vectors (deltas), not absolute weights!
-        log_print("\n[SETUP] Loading base model for task vector computation...")
-        base_model = AutoModelForCausalLM.from_pretrained(
-            self.base_model_path,
-            torch_dtype=torch.float16,
-            device_map="cpu",  # Keep on CPU to save GPU memory
-        )
-        log_print("  ✓ Base model loaded")
 
         # Process each fine-tuned model
         for idx, (ft_model_path, dataset_name) in enumerate(
@@ -368,29 +358,38 @@ class LLaMAMerger:
                 f"  [4/4] Generating importance masks (top {int(self.density*100)}% weights)..."
             )
 
-            # CRITICAL FIX: Compute task vectors first!
-            # Importance should be calculated on DELTAS (task vectors), not absolute weights
-            log_print("    Computing task vectors (ft_weight - base_weight)...")
-            base_linear_layers = self._find_linear_layers(base_model)
+            # Load pre-computed task vectors from cache
+            log_print("    Loading task vectors from cache...")
+            task_vector_file = self.task_vector_dir / f"task_vector_{idx}.pt"
+            if not task_vector_file.exists():
+                raise FileNotFoundError(
+                    f"Task vector cache not found: {task_vector_file}\n"
+                    f"Please run compute_and_save_task_vectors() first!"
+                )
+            task_vector_dict = torch.load(task_vector_file, map_location="cpu")
+            log_print(f"    ✓ Loaded {len(task_vector_dict)} task vectors")
 
             importance_masks = {}
             for layer_name, h_inv_diag in hessian_inv_diags.items():
-                # Get fine-tuned layer weights
-                ft_layer = linear_layers[layer_name]
-                ft_weight = ft_layer.weight.data.cpu()
+                # Find matching key in task vector cache
+                layer_key = None
+                for key in task_vector_dict.keys():
+                    if layer_name in key or key in layer_name:
+                        layer_key = key
+                        break
 
-                # Get base layer weights
-                if layer_name not in base_linear_layers:
-                    log_print(
-                        f"    ⚠ Layer {layer_name} not found in base model, using ft weights directly"
-                    )
-                    task_vector = ft_weight
-                else:
-                    base_layer = base_linear_layers[layer_name]
-                    base_weight = base_layer.weight.data.cpu()
+                if layer_key is None:
+                    # Try adding .weight suffix
+                    if f"{layer_name}.weight" in task_vector_dict:
+                        layer_key = f"{layer_name}.weight"
+                    else:
+                        log_print(
+                            f"    ⚠ Layer {layer_name} not found in task vectors, skipping"
+                        )
+                        continue
 
-                    # Compute TASK VECTOR: τ = θ_ft - θ_base
-                    task_vector = ft_weight - base_weight
+                # Get task vector from cache
+                task_vector = task_vector_dict[layer_key]
 
                 # Calculate importance on TASK VECTOR (the actual change)
                 # importance = task_vector^2 / (H^{-1})^2
@@ -423,17 +422,12 @@ class LLaMAMerger:
 
             # Free memory
             log_print(f"  Cleaning up memory...")
-            del model, calibration_data, hessian_inv_diags, importance_masks
+            del model, calibration_data, hessian_inv_diags, importance_masks, task_vector_dict
             gc.collect()
             torch.cuda.empty_cache()
-            log_print(f"  ✓ Model {idx+1}/{len(self.finetuned_model_paths)} complete!")
-
-        # Clean up base model after all processing
-        log_print("\n[CLEANUP] Removing base model from memory...")
-        del base_model, base_linear_layers
-        gc.collect()
-        torch.cuda.empty_cache()
-        log_print("  ✓ Base model cleaned up")
+            log_print(
+                f"  ✓ Model {idx+1}/{len(self.finetuned_model_paths)} complete!"
+            )
 
         log_print("\n✓ Importance mask computation complete!")
         log_print(
@@ -441,108 +435,64 @@ class LLaMAMerger:
         )
 
     # ============================================================================
-    # HELPER: On-the-fly Task Vector Computation
+    # HELPER: Load Cached Task Vectors
     # ============================================================================
 
     def _compute_task_vectors_for_layer(
         self, layer_name: str
     ) -> tuple[List[torch.Tensor], torch.device]:
         """
-        Compute task vectors on-the-fly for a specific layer.
-        This eliminates the need to cache 6GB task vector files!
-
-        Returns:
-            tuple: (task_vectors, model_device) - List of task vectors and the device models are on
-
-        OPTIMIZATION: Cache ft models to avoid reloading for EVERY layer!
+        Load cached task vectors for a specific layer from disk.
+        
+        This method now loads PRE-COMPUTED task vectors instead of computing on-the-fly.
+        Task vectors are computed once by compute_and_save_task_vectors() and reused
+        across all three merging methods (TIES-Magnitude, DARE-Random, TIES-SparseGPT).
 
         Args:
-            layer_name: Name of the layer (e.g., 'model.layers.0.mlp.gate_proj')
+            layer_name: Name of the layer to load task vectors for
 
         Returns:
-            List of task vectors (one per fine-tuned model)
+            Tuple of (task_vectors, device)
         """
-        # Load base model if not cached
-        if not hasattr(self, "_base_model_cache"):
-            log_print("  Loading base model (cached for all layers)...")
-            self._base_model_cache = AutoModelForCausalLM.from_pretrained(
-                self.base_model_path, torch_dtype=torch.float16, device_map="cpu"
-            )
-            self._model_device = torch.device("cpu")  # Track device
-
-        # Load ft models if not cached (MAJOR OPTIMIZATION!)
-        if not hasattr(self, "_ft_models_cache"):
-            log_print("  Loading fine-tuned models (cached for all layers)...")
-            self._ft_models_cache = []
-
-            # Try GPU first for maximum speed
-            device_to_use = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            all_models_loaded = []
-
-            # Try loading all models (base + ft) on GPU
-            if device_to_use.type == "cuda":
-                log_print(
-                    f"  Attempting to load all models on GPU for maximum speed..."
-                )
-                try:
-                    # Try moving base to GPU first
-                    test_base = self._base_model_cache.to(device_to_use)
-
-                    # Try loading ft models
-                    for idx, ft_path in enumerate(self.finetuned_model_paths):
-                        ft_model = self._load_lora_merged_model(ft_path)
-                        ft_model = ft_model.to(device_to_use)
-                        all_models_loaded.append(ft_model)
-
-                    # Success! All models fit on GPU
-                    self._base_model_cache = test_base
-                    self._model_device = device_to_use
-                    self._ft_models_cache = all_models_loaded
-                    log_print(f"  ✓ All models loaded on GPU for fastest processing!")
-
-                    for idx in range(len(self._ft_models_cache)):
-                        log_print(
-                            f"    ✓ Model {idx+1}/{len(self.finetuned_model_paths)} on cuda"
-                        )
-
-                except RuntimeError as e:
-                    if "out of memory" in str(e).lower() or "cuda" in str(e).lower():
-                        log_print(
-                            f"    ⚠ Cannot fit all models on GPU, falling back to CPU"
-                        )
-                        torch.cuda.empty_cache()
-                        device_to_use = torch.device("cpu")
-                        all_models_loaded = []
-                        # Base model is still on CPU from initial load
-                    else:
-                        raise
-
-            # If GPU failed or not available, load on CPU
-            if not self._ft_models_cache:
-                log_print(f"  Loading models on CPU...")
-                for idx, ft_path in enumerate(self.finetuned_model_paths):
-                    ft_model = self._load_lora_merged_model(ft_path)
-                    ft_model = ft_model.to(torch.device("cpu"))
-                    self._ft_models_cache.append(ft_model)
-                    log_print(
-                        f"    ✓ Loaded ft model {idx+1}/{len(self.finetuned_model_paths)} on cpu"
-                    )
-                self._model_device = torch.device("cpu")
-
-        # Get base layer parameters
-        base_params = self._get_layer_params(self._base_model_cache, layer_name)
-
-        # Compute task vector for each fine-tuned model
+        # Load task vectors from cache
         task_vectors = []
-        for ft_model in self._ft_models_cache:
-            ft_params = self._get_layer_params(ft_model, layer_name)
 
-            # Compute task vector: τ = θ_ft - θ_base
-            # Ensure both are on same device
-            task_vector = ft_params.to(base_params.device) - base_params
-            task_vectors.append(task_vector)
+        for idx in range(len(self.finetuned_model_paths)):
+            task_vector_file = self.task_vector_dir / f"task_vector_{idx}.pt"
 
-        return task_vectors, self._model_device
+            if not task_vector_file.exists():
+                raise FileNotFoundError(
+                    f"Task vector cache not found: {task_vector_file}\\n"
+                    f"Please run compute_and_save_task_vectors() first!"
+                )
+
+            # Load cached task vectors for this model
+            task_vector_dict = torch.load(task_vector_file, map_location="cpu")
+
+            # Find the matching key for this layer
+            # Handle both exact matches and partial matches (e.g., with/without .weight)
+            layer_key = None
+            for key in task_vector_dict.keys():
+                if layer_name in key or key in layer_name:
+                    layer_key = key
+                    break
+
+            if layer_key is None:
+                # Try adding .weight suffix
+                if f"{layer_name}.weight" in task_vector_dict:
+                    layer_key = f"{layer_name}.weight"
+                else:
+                    raise KeyError(
+                        f"Layer '{layer_name}' not found in cached task vectors for model {idx}.\\n"
+                        f"Available keys: {list(task_vector_dict.keys())[:10]}..."
+                    )
+
+            task_vectors.append(task_vector_dict[layer_key])
+
+        # Determine device
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        return task_vectors, device
 
     def _load_lora_merged_model(
         self, lora_path: str, layer_name: str = None
@@ -570,13 +520,18 @@ class LLaMAMerger:
         return merged_model
 
     # ============================================================================
-    # OLD STEP 2: Compute Task Vectors (DEPRECATED - Now computed on-the-fly)
+    # STEP 1: Compute and Cache Task Vectors (Shared by all methods)
     # ============================================================================
 
     def compute_and_save_task_vectors(self):
         """
         Compute task vectors (ft_weights - base_weights) for each model.
-
+        
+        This is computed ONCE and used by ALL three merging methods:
+        - TIES-Magnitude
+        - DARE-Random
+        - TIES-SparseGPT
+        
         Process ONE MODEL AT A TIME to save memory:
         1. Load base model
         2. For each fine-tuned model:
@@ -587,7 +542,7 @@ class LLaMAMerger:
         3. Unload base model
         """
         log_print("=" * 60)
-        log_print("STEP 1: Computing Task Vectors")
+        log_print("STEP 1: Computing Task Vectors (Shared by All Methods)")
         log_print("=" * 60)
 
         # Load base model ONCE
@@ -1164,15 +1119,12 @@ class LLaMAMerger:
         return merged_model
 
     def _clear_base_model_cache(self):
-        """Clear cached base and ft models to free memory."""
-        if hasattr(self, "_base_model_cache"):
-            del self._base_model_cache
-        if hasattr(self, "_ft_models_cache"):
-            del self._ft_models_cache
-        if hasattr(self, "_model_device"):
-            del self._model_device
-        gc.collect()
-        torch.cuda.empty_cache()
+        """
+        Clear cached base and ft models to free memory.
+        NOTE: This is now a no-op since we use disk-cached task vectors instead.
+        Kept for backward compatibility.
+        """
+        pass  # Task vectors loaded from disk, no models cached in memory
 
     def merge_with_dare(self, use_sparsegpt: bool = False) -> AutoModelForCausalLM:
         """
@@ -1493,12 +1445,15 @@ class LLaMAMerger:
 
     def merge_all_methods(self) -> Dict[str, Dict]:
         """
-        STORAGE-OPTIMIZED: Run all three merging methods and compare results.
-
-        New approach:
-        - Task vectors computed on-the-fly (no storage)
-        - Only importance masks cached (~100MB each)
-        - Total cache: ~200MB vs old ~24GB
+        Run all three merging methods and compare results.
+        
+        Optimized workflow:
+        1. Compute task vectors once (cached to disk, ~2-6GB total)
+        2. Compute importance masks once (cached to disk, ~100MB each)
+        3. Reuse cached data for all three methods
+        
+        Total cache: ~2-6GB task vectors + ~200MB masks
+        vs OLD: ~24GB (multiple redundant copies)
 
         Returns:
             Dictionary with results for each method
@@ -1506,13 +1461,16 @@ class LLaMAMerger:
         log_print("\n" + "=" * 60)
         log_print("COMPREHENSIVE MODEL MERGING COMPARISON")
         log_print("=" * 60)
-        log_print("STORAGE-OPTIMIZED MODE:")
-        log_print("  - Task vectors: Computed on-demand (0MB cached)")
+        log_print("OPTIMIZED MODE:")
+        log_print("  - Task vectors: Computed once, cached (~2-6GB)")
         log_print("  - Importance masks: ~100MB each (cached)")
-        log_print(f"  - Total cache: ~{len(self.finetuned_model_paths) * 100}MB")
+        log_print(f"  - Total cache: ~{len(self.finetuned_model_paths) * 2000 + len(self.finetuned_model_paths) * 100}MB")
         log_print("=" * 60)
 
-        # Step 1: For SparseGPT method, compute and cache importance masks
+        # Step 1: Compute task vectors (shared by all methods)
+        self.compute_and_save_task_vectors()
+        
+        # Step 2: For SparseGPT method, compute and cache importance masks
         # (TIES and DARE don't need this - they use magnitude-based selection)
         self.compute_and_cache_importance_masks()
 
