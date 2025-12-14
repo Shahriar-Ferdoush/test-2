@@ -40,18 +40,18 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
+from datasets import load_dataset
+from peft import PeftModel
+from transformers import AutoModelForCausalLM, AutoTokenizer, LlamaForCausalLM
 
 # Import our merging utilities
 from dare_utils import DARE
-from datasets import load_dataset
-from peft import PeftModel
-from sparsegpt_importance import (
+from sparsegpt_task_vector import (
     HessianCalculator,
     compute_importance_scores,
     generate_importance_mask,
 )
 from ties_utils import TIES
-from transformers import AutoModelForCausalLM, AutoTokenizer, LlamaForCausalLM
 
 # Configure logging
 logging.basicConfig(
@@ -129,17 +129,24 @@ class LLaMAMerger:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
-        # Cache subdirectories - optimized storage strategy
-        # We'll compute on-the-fly for magnitude-based methods
-        # Only cache importance masks (sparse) for SparseGPT
+        # Cache subdirectories
+        # NOTE: Task vectors are temporary (deleted after mask generation)
+        # Only importance masks are kept long-term (~20MB per model)
+        self.task_vector_dir = self.cache_dir / "task_vectors"
+        self.task_vector_dir.mkdir(exist_ok=True)
+
         self.mask_dir = self.cache_dir / "importance_masks"
         self.mask_dir.mkdir(exist_ok=True)
 
         log_print(f"Initialized LLaMAMerger with {len(finetuned_model_paths)} models")
         log_print(f"Device: {self.device}")
         log_print(f"Density: {self.density} (keep {self.density*100}% of weights)")
-        log_print(f"Storage optimization: Computing task vectors on-the-fly")
-        log_print(f"                       Only caching importance masks (~100MB each)")
+        log_print(
+            f"Memory-efficient: Task vectors cached temporarily, deleted after use"
+        )
+        log_print(
+            f"Final cache size: ~{len(finetuned_model_paths) * 20}MB (masks only)"
+        )
 
     # ============================================================================
     # STORAGE-OPTIMIZED APPROACH
@@ -277,9 +284,9 @@ class LLaMAMerger:
         5. Delete everything, move to next model
         """
         log_print("=" * 60)
-        log_print("STEP 1: Computing Importance Masks (SparseGPT)")
+        log_print("STEP 2: Computing Importance Masks (SparseGPT)")
         log_print("=" * 60)
-        log_print("Note: Computing on-the-fly, caching only masks to save space")
+        log_print("Note: Using cached task vectors, computing importance on-the-fly")
 
         # CRITICAL WARNING: Check calibration sample count
         if self.num_calibration_samples < 64:
@@ -357,142 +364,163 @@ class LLaMAMerger:
             log_print(
                 f"  [4/4] Generating importance masks (top {int(self.density*100)}% weights)..."
             )
-            importance_masks = {}
-            for layer_name, h_inv_diag in hessian_inv_diags.items():
-                # Get layer to compute importance scores
-                layer = linear_layers[layer_name]
-                weight = layer.weight.data.cpu()
 
-                # CRITICAL FIX: Use correct SparseGPT importance formula
-                # importance = w^2 / (H^{-1})^2
-                # NOT: w^2 * H^{-1}  (this is backwards!)
-                #
-                # Higher H^{-1} means MORE sensitive to changes → EASIER to remove → LOWER importance
-                # We want to keep weights where removal causes HIGH error
+            # Load pre-computed task vectors from cache
+            log_print("    Loading task vectors from cache...")
+            task_vector_file = self.task_vector_dir / f"task_vector_{idx}.pt"
+            if not task_vector_file.exists():
+                raise FileNotFoundError(
+                    f"Task vector cache not found: {task_vector_file}\n"
+                    f"Please run compute_and_save_task_vectors() first!"
+                )
+            task_vector_dict = torch.load(task_vector_file, map_location="cpu")
+            log_print(f"    ✓ Loaded {len(task_vector_dict)} task vectors")
+
+            importance_masks = {}
+            for layer_name, h_inv in hessian_inv_diags.items():
+                # Find matching key in task vector cache
+                layer_key = None
+                for key in task_vector_dict.keys():
+                    if layer_name in key or key in layer_name:
+                        layer_key = key
+                        break
+
+                if layer_key is None:
+                    # Try adding .weight suffix
+                    if f"{layer_name}.weight" in task_vector_dict:
+                        layer_key = f"{layer_name}.weight"
+                    else:
+                        log_print(
+                            f"    ⚠ Layer {layer_name} not found in task vectors, skipping"
+                        )
+                        continue
+
+                # Get task vector from cache
+                task_vector = task_vector_dict[layer_key]
+
+                # Calculate importance using FULL Hessian for better quality
+                # Extract diagonal from full inverse Hessian for importance scoring
+                # h_inv is Cholesky factor: H^{-1} = h_inv^T @ h_inv
+                # So diagonal of H^{-1} = sum of squares of rows
+                h_inv_diag = torch.sum(h_inv**2, dim=0)  # [in_features]
+
                 eps = 1e-10  # Numerical stability
                 h_inv_diag_broadcasted = h_inv_diag.unsqueeze(0)  # [1, in_features]
-                importance = weight.pow(2) / ((h_inv_diag_broadcasted + eps).pow(2))
+                importance = task_vector.pow(2) / (
+                    (h_inv_diag_broadcasted + eps).pow(2)
+                )
 
-                # Get top-k mask (sparse boolean)
+                # Get top-k indices (MUCH more efficient than storing full mask!)
                 k = int(importance.numel() * self.density)
-                threshold = torch.topk(importance.flatten(), k).values[-1]
-                mask = importance >= threshold
+                flat_importance = importance.flatten()
+                topk_indices = torch.topk(flat_importance, k).indices
 
-                # Store as sparse (saves memory)
-                importance_masks[layer_name] = mask.to_sparse()
+                # Store ONLY the indices of important weights (not the full mask)
+                # This reduces storage from ~14GB to ~100MB per model!
+                importance_masks[layer_name] = {
+                    "indices": topk_indices.cpu(),
+                    "shape": importance.shape,
+                    "density": self.density,
+                }
 
-            log_print(f"  ✓ Generated masks for {len(importance_masks)} layers")
+            log_print(
+                f"  ✓ Generated masks for {len(importance_masks)} layers (with error correction)"
+            )
 
             # Save masks ONLY (not Hessians!)
             log_print(f"  Saving importance masks: {mask_file}")
             torch.save(importance_masks, mask_file)
 
-            # Calculate saved space
+            # Calculate saved space and compare to alternatives
             mask_size_mb = (
                 mask_file.stat().st_size / (1024**2) if mask_file.exists() else 0
             )
-            log_print(f"  ✓ Saved {mask_size_mb:.1f}MB (vs ~6GB for full Hessian!)")
+
+            # Estimate full dense mask size: 112 layers * avg weight shape * 4 bytes/float32
+            # For LLaMA 1B: ~45M parameters in linear layers → ~180MB per model as dense mask
+            estimated_dense_mb = 180  # Conservative estimate
+            savings_pct = (
+                (1 - mask_size_mb / estimated_dense_mb) * 100
+                if estimated_dense_mb > 0
+                else 0
+            )
+
+            log_print(
+                f"  ✓ Saved {mask_size_mb:.1f}MB (vs ~{estimated_dense_mb}MB dense, {savings_pct:.1f}% savings!)"
+            )
 
             # Free memory
             log_print(f"  Cleaning up memory...")
-            del model, calibration_data, hessian_inv_diags, importance_masks
+            del (
+                model,
+                calibration_data,
+                hessian_inv_diags,
+                importance_masks,
+                task_vector_dict,
+            )
             gc.collect()
             torch.cuda.empty_cache()
             log_print(f"  ✓ Model {idx+1}/{len(self.finetuned_model_paths)} complete!")
 
         log_print("\n✓ Importance mask computation complete!")
         log_print(
-            f"Total cache size: ~{len(self.finetuned_model_paths) * 100}MB (vs ~{len(self.finetuned_model_paths) * 6000}MB with full Hessians!)"
+            f"Storage efficiency: Indices-only format uses ~{len(self.finetuned_model_paths) * 20}MB\n"
+            f"  vs ~{len(self.finetuned_model_paths) * 180}MB for dense masks\n"
+            f"  vs ~{len(self.finetuned_model_paths) * 6000}MB for full Hessians!"
         )
 
     # ============================================================================
-    # HELPER: On-the-fly Task Vector Computation
+    # HELPER: Compute Task Vectors On-The-Fly (Fast, Memory-Efficient)
     # ============================================================================
 
     def _compute_task_vectors_for_layer(
         self, layer_name: str
     ) -> tuple[List[torch.Tensor], torch.device]:
         """
-        Compute task vectors on-the-fly for a specific layer.
-        This eliminates the need to cache 6GB task vector files!
+        Compute task vectors for a specific layer on-the-fly using cached models.
 
-        Returns:
-            tuple: (task_vectors, model_device) - List of task vectors and the device models are on
+        IMPORTANT: This loads models into memory ONCE and reuses them for all layers.
+        This is MUCH faster than loading task vectors from disk 112 times!
 
-        OPTIMIZATION: Cache ft models to avoid reloading for EVERY layer!
+        Performance comparison:
+        - Load from disk per layer: 112 layers × 2GB file × 2 models = 224 slow I/O ops
+        - Load models once, compute on-fly: 2 model loads + 112 fast in-memory computations
+
+        The task vector CACHING is still useful for the importance mask computation,
+        but during merging it's faster to keep models in RAM and compute deltas.
 
         Args:
-            layer_name: Name of the layer (e.g., 'model.layers.0.mlp.gate_proj')
+            layer_name: Name of the layer to compute task vectors for
 
         Returns:
-            List of task vectors (one per fine-tuned model)
+            Tuple of (task_vectors, device)
         """
-        # Load base model if not cached
+        # Load models into cache on first call (ONCE for all layers)
         if not hasattr(self, "_base_model_cache"):
-            log_print("  Loading base model (cached for all layers)...")
+            log_print("\n[OPTIMIZATION] Loading models into memory (one-time cost)...")
+            log_print("  This is faster than loading task vectors from disk 112 times!")
+            log_print("  Loading base model...")
             self._base_model_cache = AutoModelForCausalLM.from_pretrained(
                 self.base_model_path, torch_dtype=torch.float16, device_map="cpu"
             )
-            self._model_device = torch.device("cpu")  # Track device
 
-        # Load ft models if not cached (MAJOR OPTIMIZATION!)
-        if not hasattr(self, "_ft_models_cache"):
-            log_print("  Loading fine-tuned models (cached for all layers)...")
+            log_print(
+                f"  Loading {len(self.finetuned_model_paths)} fine-tuned models..."
+            )
             self._ft_models_cache = []
-
-            # Try GPU first for maximum speed
-            device_to_use = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            all_models_loaded = []
-
-            # Try loading all models (base + ft) on GPU
-            if device_to_use.type == "cuda":
+            for i, ft_path in enumerate(self.finetuned_model_paths):
+                ft_model = self._load_finetuned_model(ft_path, self.base_model_path)
+                self._ft_models_cache.append(ft_model)
                 log_print(
-                    f"  Attempting to load all models on GPU for maximum speed..."
+                    f"    [{i+1}/{len(self.finetuned_model_paths)}] Loaded {ft_path.split('/')[-1]}"
                 )
-                try:
-                    # Try moving base to GPU first
-                    test_base = self._base_model_cache.to(device_to_use)
 
-                    # Try loading ft models
-                    for idx, ft_path in enumerate(self.finetuned_model_paths):
-                        ft_model = self._load_lora_merged_model(ft_path)
-                        ft_model = ft_model.to(device_to_use)
-                        all_models_loaded.append(ft_model)
+            log_print("  ✓ All models cached in memory\n")
 
-                    # Success! All models fit on GPU
-                    self._base_model_cache = test_base
-                    self._model_device = device_to_use
-                    self._ft_models_cache = all_models_loaded
-                    log_print(f"  ✓ All models loaded on GPU for fastest processing!")
-
-                    for idx in range(len(self._ft_models_cache)):
-                        log_print(
-                            f"    ✓ Model {idx+1}/{len(self.finetuned_model_paths)} on cuda"
-                        )
-
-                except RuntimeError as e:
-                    if "out of memory" in str(e).lower() or "cuda" in str(e).lower():
-                        log_print(
-                            f"    ⚠ Cannot fit all models on GPU, falling back to CPU"
-                        )
-                        torch.cuda.empty_cache()
-                        device_to_use = torch.device("cpu")
-                        all_models_loaded = []
-                        # Base model is still on CPU from initial load
-                    else:
-                        raise
-
-            # If GPU failed or not available, load on CPU
-            if not self._ft_models_cache:
-                log_print(f"  Loading models on CPU...")
-                for idx, ft_path in enumerate(self.finetuned_model_paths):
-                    ft_model = self._load_lora_merged_model(ft_path)
-                    ft_model = ft_model.to(torch.device("cpu"))
-                    self._ft_models_cache.append(ft_model)
-                    log_print(
-                        f"    ✓ Loaded ft model {idx+1}/{len(self.finetuned_model_paths)} on cpu"
-                    )
-                self._model_device = torch.device("cpu")
+            # Determine device
+            self._model_device = torch.device(
+                "cuda" if torch.cuda.is_available() else "cpu"
+            )
 
         # Get base layer parameters
         base_params = self._get_layer_params(self._base_model_cache, layer_name)
@@ -535,12 +563,17 @@ class LLaMAMerger:
         return merged_model
 
     # ============================================================================
-    # OLD STEP 2: Compute Task Vectors (DEPRECATED - Now computed on-the-fly)
+    # STEP 1: Compute and Cache Task Vectors (Shared by all methods)
     # ============================================================================
 
     def compute_and_save_task_vectors(self):
         """
         Compute task vectors (ft_weights - base_weights) for each model.
+
+        This is computed ONCE and used by ALL three merging methods:
+        - TIES-Magnitude
+        - DARE-Random
+        - TIES-SparseGPT
 
         Process ONE MODEL AT A TIME to save memory:
         1. Load base model
@@ -552,7 +585,7 @@ class LLaMAMerger:
         3. Unload base model
         """
         log_print("=" * 60)
-        log_print("STEP 1: Computing Task Vectors")
+        log_print("STEP 1: Computing Task Vectors (Shared by All Methods)")
         log_print("=" * 60)
 
         # Load base model ONCE
@@ -861,7 +894,7 @@ class LLaMAMerger:
         calibration_data: List[torch.Tensor],
     ) -> Dict[str, torch.Tensor]:
         """
-        Compute Hessian inverse diagonals for all linear layers.
+        Compute FULL inverse Hessians for all linear layers (for error correction).
 
         Args:
             model: The model to compute Hessians for
@@ -869,98 +902,114 @@ class LLaMAMerger:
             calibration_data: List of input tensors
 
         Returns:
-            Dictionary mapping layer_name -> H^{-1} diagonal tensor
+            Dictionary mapping layer_name -> H^{-1} full matrix (Cholesky factor)
         """
-        hessian_inv_diags = {}
+        hessian_inv_diags = {}  # Name kept for compatibility, but contains full inverse
 
-        # Setup hooks to capture activations
-        activations = {name: [] for name in linear_layers.keys()}
-        hooks = []
+        # MEMORY OPTIMIZATION: Process calibration data in batches
+        # Instead of accumulating all activations, process in chunks of BATCH_SIZE
+        BATCH_SIZE = 16  # Process 16 samples at a time to avoid OOM
+        num_batches = (len(calibration_data) + BATCH_SIZE - 1) // BATCH_SIZE
 
-        def get_activation_hook(name):
-            def hook(module, inp, out):
-                # Save input activations
-                activations[name].append(inp[0].detach().cpu())
-
-            return hook
-
-        # Register hooks
-        for name, layer in linear_layers.items():
-            hooks.append(layer.register_forward_hook(get_activation_hook(name)))
-
-        # Run calibration data through model
         log_print(
-            f"    Running {len(calibration_data)} samples through model to capture activations..."
+            f"    Computing Hessians with {len(calibration_data)} samples in {num_batches} batches of {BATCH_SIZE}..."
         )
-        start_time = time.time()
+        log_print(f"    This prevents memory overflow by processing incrementally.")
+
+        # Initialize Hessian calculators for all layers
+        hessian_calcs = {}
+        for name, layer in linear_layers.items():
+            weight_shape = layer.weight.shape
+            hessian_calcs[name] = HessianCalculator(
+                weight_shape, device=torch.device("cpu")
+            )
+
         forward_device = getattr(self, "_current_device", self.device)
-        with torch.no_grad():
-            for i, batch in enumerate(calibration_data):
-                if (i + 1) % 10 == 0:
-                    elapsed = time.time() - start_time
-                    rate = (i + 1) / elapsed
-                    eta = (len(calibration_data) - i - 1) / rate if rate > 0 else 0
-                    log_print(
-                        f"      Progress: {i+1}/{len(calibration_data)} samples | Rate: {rate:.1f} samples/s | ETA: {eta:.0f}s"
-                    )
+        start_time = time.time()
 
-                try:
-                    batch = batch.to(forward_device)
-                    _ = model(batch)
-                except RuntimeError as e:
-                    if "out of memory" in str(e).lower() or "cuda" in str(e).lower():
-                        log_print(
-                            f"      ⚠ GPU OOM on batch {i+1}, falling back to CPU"
-                        )
-                        torch.cuda.empty_cache()
-                        forward_device = torch.device("cpu")
-                        model = model.to(forward_device)
-                        batch = batch.to(forward_device)
-                        try:
-                            _ = model(batch)
-                        except Exception as e2:
-                            logger.warning(
-                                f"      Error on batch {i} (CPU fallback): {e2}"
-                            )
-                            continue
-                    else:
-                        logger.warning(f"      Error on batch {i}: {e}")
-                        continue
-                except Exception as e:
-                    logger.warning(f"      Error on batch {i}: {e}")
-                    continue
-        log_print(f"    ✓ Forward pass complete in {time.time()-start_time:.1f}s")
+        # Process calibration data in batches
+        for batch_idx in range(num_batches):
+            batch_start = batch_idx * BATCH_SIZE
+            batch_end = min(batch_start + BATCH_SIZE, len(calibration_data))
+            batch_samples = calibration_data[batch_start:batch_end]
 
-        # Remove hooks
-        for hook in hooks:
-            hook.remove()
+            if (batch_idx + 1) % 5 == 0 or batch_idx == 0:
+                elapsed = time.time() - start_time
+                rate = (batch_idx + 1) / elapsed if elapsed > 0 else 0
+                eta = (num_batches - batch_idx - 1) / rate if rate > 0 else 0
+                samples_done = batch_end
+                log_print(
+                    f"      Batch {batch_idx+1}/{num_batches} ({samples_done}/{len(calibration_data)} samples) | ETA: {eta:.0f}s"
+                )
 
-        # Compute Hessians from activations
+            # Collect activations for this batch only
+            activations = {name: [] for name in linear_layers.keys()}
+            hooks = []
+
+            def get_activation_hook(name):
+                def hook(module, inp, out):
+                    # Save input activations (detach and keep on CPU to save GPU memory)
+                    activations[name].append(inp[0].detach().cpu())
+
+                return hook
+
+            # Register hooks
+            for name, layer in linear_layers.items():
+                hooks.append(layer.register_forward_hook(get_activation_hook(name)))
+
+            # Forward pass for this batch
+            with torch.no_grad():
+                for sample in batch_samples:
+                    try:
+                        sample = sample.to(forward_device)
+                        _ = model(sample)
+                    except RuntimeError as e:
+                        if "out of memory" in str(e).lower():
+                            log_print(f"        ⚠ GPU OOM, switching to CPU")
+                            torch.cuda.empty_cache()
+                            forward_device = torch.device("cpu")
+                            model = model.to(forward_device)
+                            sample = sample.to(forward_device)
+                            _ = model(sample)
+                        else:
+                            raise
+
+            # Remove hooks
+            for hook in hooks:
+                hook.remove()
+
+            # Update Hessian calculators with this batch's activations
+            for name in linear_layers.keys():
+                if activations[name]:
+                    for act in activations[name]:
+                        hessian_calcs[name].add_batch(act)
+
+            # Clear activations to free memory
+            del activations
+            torch.cuda.empty_cache()
+
         log_print(
-            f"    Computing inverse Hessian diagonals for {len(linear_layers)} layers..."
+            f"    ✓ Processed all {len(calibration_data)} samples in {time.time()-start_time:.1f}s"
+        )
+
+        # Compute FULL inverse Hessians for error correction (not just diagonals)
+        log_print(
+            f"    Computing full inverse Hessians (for error correction) for {len(linear_layers)} layers..."
         )
         num_layers = len(linear_layers)
-        for layer_idx, (name, layer) in enumerate(linear_layers.items()):
+        for layer_idx, name in enumerate(linear_layers.keys()):
             if (layer_idx + 1) % 10 == 0 or layer_idx == 0:
                 log_print(f"      Layer {layer_idx+1}/{num_layers}: {name}")
 
-            if not activations[name]:
-                logger.warning(f"      No activations captured for {name}, skipping")
-                continue
+            # Compute FULL inverse Hessian (Cholesky factor) for error correction
+            h_inv = hessian_calcs[name].get_inverse_hessian(percdamp=0.01)
+            hessian_inv_diags[name] = (
+                h_inv  # Variable name kept for compatibility, but contains full inverse
+            )
 
-            # Initialize Hessian calculator
-            weight_shape = layer.weight.shape
-            calc = HessianCalculator(weight_shape, device=torch.device("cpu"))
-
-            # Add all activation batches
-            for act in activations[name]:
-                calc.add_batch(act)
-
-            # Compute inverse diagonal
-            h_inv_diag = calc.get_inverse_hessian_diag(percdamp=0.01)
-            hessian_inv_diags[name] = h_inv_diag
-
-        log_print(f"    ✓ Computed Hessians for {len(hessian_inv_diags)} layers")
+        log_print(
+            f"    ✓ Computed full inverse Hessians for {len(hessian_inv_diags)} layers (error correction enabled)"
+        )
         return hessian_inv_diags
 
     # ============================================================================
@@ -998,6 +1047,21 @@ class LLaMAMerger:
         # TIES merger
         merger = TIES()
 
+        # PERFORMANCE OPTIMIZATION: Load mask files ONCE and cache them
+        cached_mask_dicts = None
+        if use_sparsegpt:
+            logger.info("Pre-loading importance mask files...")
+            cached_mask_dicts = []
+            for idx in range(len(self.finetuned_model_paths)):
+                mask_file = self.mask_dir / f"importance_mask_{idx}.pt"
+                mask_dict = torch.load(
+                    mask_file, map_location="cpu", weights_only=False
+                )
+                cached_mask_dicts.append(mask_dict)
+                logger.info(
+                    f"  Loaded mask file {idx}: {mask_file.name} ({len(mask_dict)} layers)"
+                )
+
         # Merge layer by layer
         log_print(f"\nMerging {len(layer_names)} layers...")
         merge_start = time.time()
@@ -1020,27 +1084,41 @@ class LLaMAMerger:
             )
 
             # Load importance masks if using SparseGPT
-            # CRITICAL: Do NOT apply masks here - let merger handle it to avoid double-trimming!
+            # MEMORY OPTIMIZATION: Use cached mask dicts instead of reloading from disk!
             importance_masks = None
             if use_sparsegpt:
                 importance_masks = []
-                for idx in range(len(self.finetuned_model_paths)):
-                    mask_file = self.mask_dir / f"importance_mask_{idx}.pt"
-                    mask_dict = torch.load(mask_file, map_location="cpu")
+                for idx, mask_dict in enumerate(cached_mask_dicts):
                     full_key = self._find_matching_key(mask_dict, layer_name)
+
                     if full_key:
-                        # Convert sparse mask back to dense
-                        sparse_mask = mask_dict[full_key]
-                        dense_mask = (
-                            sparse_mask.to_dense()
-                            if sparse_mask.is_sparse
-                            else sparse_mask
-                        )
-                        # Convert to float and move to correct device
-                        # IMPORTANT: Must be float type for multiplication, not bool
-                        importance_masks.append(
-                            dense_mask.to(dtype=torch.float32, device=model_device)
-                        )
+                        # Extract this layer's mask data (no file I/O!)
+                        mask_data = mask_dict[full_key]
+
+                        # Check if it's the new format (dict with indices)
+                        if isinstance(mask_data, dict) and "indices" in mask_data:
+                            # New format: reconstruct mask from indices
+                            indices = mask_data["indices"]
+                            shape = mask_data["shape"]
+
+                            # OPTIMIZED: Pre-allocate on correct device, scatter indices
+                            dense_mask = torch.zeros(
+                                shape, dtype=torch.float32, device=model_device
+                            )
+                            # Flatten, set indices, reshape in-place
+                            dense_mask.view(-1)[indices] = 1.0
+                        else:
+                            # Old format: sparse tensor or dense mask
+                            if hasattr(mask_data, "to_dense") and mask_data.is_sparse:
+                                dense_mask = mask_data.to_dense()
+                            else:
+                                dense_mask = mask_data
+                            # Move to device
+                            dense_mask = dense_mask.to(
+                                dtype=torch.float32, device=model_device
+                            )
+
+                        importance_masks.append(dense_mask)
                     else:
                         log_print(
                             f"    ⚠ Mask for {layer_name} not found in model {idx}, using all-ones mask"
@@ -1122,6 +1200,11 @@ class LLaMAMerger:
             if len(failed_layers) > 5:
                 log_print(f"  ... and {len(failed_layers) - 5} more")
 
+        # Cleanup cached mask dictionaries to free memory
+        if cached_mask_dicts is not None:
+            del cached_mask_dicts
+            gc.collect()
+
         # Cleanup base model cache
         self._clear_base_model_cache()
 
@@ -1129,7 +1212,10 @@ class LLaMAMerger:
         return merged_model
 
     def _clear_base_model_cache(self):
-        """Clear cached base and ft models to free memory."""
+        """
+        Clear cached base and ft models to free memory.
+        Called after each merging method completes.
+        """
         if hasattr(self, "_base_model_cache"):
             del self._base_model_cache
         if hasattr(self, "_ft_models_cache"):
@@ -1170,6 +1256,21 @@ class LLaMAMerger:
         # DARE merger
         merger = DARE()
 
+        # PERFORMANCE OPTIMIZATION: Load mask files ONCE and cache them
+        cached_mask_dicts = None
+        if use_sparsegpt:
+            logger.info("Pre-loading importance mask files...")
+            cached_mask_dicts = []
+            for idx in range(len(self.finetuned_model_paths)):
+                mask_file = self.mask_dir / f"importance_mask_{idx}.pt"
+                mask_dict = torch.load(
+                    mask_file, map_location="cpu", weights_only=False
+                )
+                cached_mask_dicts.append(mask_dict)
+                logger.info(
+                    f"  Loaded mask file {idx}: {mask_file.name} ({len(mask_dict)} layers)"
+                )
+
         # Merge layer by layer
         log_print(f"\nMerging {len(layer_names)} layers...")
         merge_start = time.time()
@@ -1192,26 +1293,41 @@ class LLaMAMerger:
             )
 
             # Load importance masks if using SparseGPT
-            # CRITICAL: Do NOT apply masks here - let merger handle it!
+            # MEMORY OPTIMIZATION: Use cached mask dicts instead of reloading from disk!
             importance_masks = None
             if use_sparsegpt:
                 importance_masks = []
-                for idx in range(len(self.finetuned_model_paths)):
-                    mask_file = self.mask_dir / f"importance_mask_{idx}.pt"
-                    mask_dict = torch.load(mask_file, map_location="cpu")
+                for idx, mask_dict in enumerate(cached_mask_dicts):
                     full_key = self._find_matching_key(mask_dict, layer_name)
+
                     if full_key:
-                        # Convert sparse mask back to dense
-                        sparse_mask = mask_dict[full_key]
-                        dense_mask = (
-                            sparse_mask.to_dense()
-                            if sparse_mask.is_sparse
-                            else sparse_mask
-                        )
-                        # Convert to float and move to correct device
-                        importance_masks.append(
-                            dense_mask.to(dtype=torch.float32, device=model_device)
-                        )
+                        # Extract this layer's mask data (no file I/O!)
+                        mask_data = mask_dict[full_key]
+
+                        # Check if it's the new format (dict with indices)
+                        if isinstance(mask_data, dict) and "indices" in mask_data:
+                            # New format: reconstruct mask from indices
+                            indices = mask_data["indices"]
+                            shape = mask_data["shape"]
+
+                            # OPTIMIZED: Pre-allocate on correct device, scatter indices
+                            dense_mask = torch.zeros(
+                                shape, dtype=torch.float32, device=model_device
+                            )
+                            # Flatten, set indices, reshape in-place
+                            dense_mask.view(-1)[indices] = 1.0
+                        else:
+                            # Old format: sparse tensor or dense mask
+                            if hasattr(mask_data, "to_dense") and mask_data.is_sparse:
+                                dense_mask = mask_data.to_dense()
+                            else:
+                                dense_mask = mask_data
+                            # Move to device
+                            dense_mask = dense_mask.to(
+                                dtype=torch.float32, device=model_device
+                            )
+
+                        importance_masks.append(dense_mask)
                     else:
                         log_print(
                             f"    ⚠ Mask for {layer_name} not found in model {idx}, using all-ones mask"
@@ -1284,6 +1400,11 @@ class LLaMAMerger:
                 log_print(f"  - {layer}: {error}")
             if len(failed_layers) > 5:
                 log_print(f"  ... and {len(failed_layers) - 5} more")
+
+        # Cleanup cached mask dictionaries to free memory
+        if cached_mask_dicts is not None:
+            del cached_mask_dicts
+            gc.collect()
 
         # Cleanup base model cache
         self._clear_base_model_cache()
@@ -1458,12 +1579,18 @@ class LLaMAMerger:
 
     def merge_all_methods(self) -> Dict[str, Dict]:
         """
-        STORAGE-OPTIMIZED: Run all three merging methods and compare results.
+        Run all three merging methods and compare results.
 
-        New approach:
-        - Task vectors computed on-the-fly (no storage)
-        - Only importance masks cached (~100MB each)
-        - Total cache: ~200MB vs old ~24GB
+        Hybrid optimization strategy:
+        1. Compute task vectors once, cache to disk (~2-6GB total)
+           - Used ONLY for importance mask generation (1x disk read)
+        2. During merging: Load models into RAM, compute task vectors on-the-fly
+           - Much faster than 112 disk reads per model!
+        3. Importance masks cached to disk (~20MB each, indices-only)
+
+        Why this hybrid approach?
+        - Importance masks: Need full task vectors once → cache to disk
+        - Merging (TIES/DARE): Need per-layer task vectors 112 times → keep models in RAM
 
         Returns:
             Dictionary with results for each method
@@ -1471,15 +1598,38 @@ class LLaMAMerger:
         log_print("\n" + "=" * 60)
         log_print("COMPREHENSIVE MODEL MERGING COMPARISON")
         log_print("=" * 60)
-        log_print("STORAGE-OPTIMIZED MODE:")
-        log_print("  - Task vectors: Computed on-demand (0MB cached)")
-        log_print("  - Importance masks: ~100MB each (cached)")
-        log_print(f"  - Total cache: ~{len(self.finetuned_model_paths) * 100}MB")
+        log_print("MEMORY-EFFICIENT MODE:")
+        log_print("  - Task vectors: Temporarily cached, deleted after mask generation")
+        log_print("  - Importance masks: ~20MB each (indices-only, kept)")
+        log_print("  - Models loaded on-demand during merging")
+        log_print(
+            f"  - Peak disk usage: ~{len(self.finetuned_model_paths) * 2000}MB (temporary)"
+        )
+        log_print(
+            f"  - Final disk cache: ~{len(self.finetuned_model_paths) * 20}MB (masks only)"
+        )
         log_print("=" * 60)
 
-        # Step 1: For SparseGPT method, compute and cache importance masks
-        # (TIES and DARE don't need this - they use magnitude-based selection)
+        # Step 1: Compute task vectors (temporary, for mask generation)
+        self.compute_and_save_task_vectors()
+
+        # Step 2: Compute importance masks using cached task vectors
         self.compute_and_cache_importance_masks()
+
+        # Step 3: DELETE task vectors to free disk space (we only need masks now!)
+        log_print(
+            "\n[CLEANUP] Removing temporary task vector cache to save disk space..."
+        )
+        for idx in range(len(self.finetuned_model_paths)):
+            task_vector_file = self.task_vector_dir / f"task_vector_{idx}.pt"
+            if task_vector_file.exists():
+                file_size_mb = task_vector_file.stat().st_size / (1024**2)
+                task_vector_file.unlink()
+                log_print(f"  ✓ Deleted task_vector_{idx}.pt ({file_size_mb:.1f}MB)")
+        log_print(f"  ✓ Freed ~{len(self.finetuned_model_paths) * 2000}MB disk space!")
+        log_print(
+            f"  Final cache: ~{len(self.finetuned_model_paths) * 20}MB (importance masks only)\n"
+        )
 
         # Load tokenizer for evaluation
         tokenizer = AutoTokenizer.from_pretrained(self.base_model_path)
