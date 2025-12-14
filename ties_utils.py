@@ -3,11 +3,10 @@ from typing import Dict, List, Literal, Optional, Tuple
 import torch
 
 try:
-    from sparsegpt_importance import (
-        apply_importance_mask,
+    from sparsegpt_task_vector import (
         compute_importance_scores,
         generate_importance_mask,
-        trim_with_sparsegpt_importance,
+        prune_task_vector_with_error_correction,
     )
 
     SPARSEGPT_AVAILABLE = True
@@ -16,7 +15,7 @@ except ImportError:
     import warnings
 
     warnings.warn(
-        "SparseGPT importance module not found. Falling back to magnitude-based trimming."
+        "SparseGPT module not found. Falling back to magnitude-based trimming."
     )
 
 
@@ -97,8 +96,9 @@ def get_task_vector(
 def trim(
     task_vector: torch.Tensor,
     density: float,
-    hessian_inv_diag: Optional[torch.Tensor] = None,
+    hessian_inv: Optional[torch.Tensor] = None,
     use_sparsegpt: bool = False,
+    blocksize: int = 128,
 ) -> torch.Tensor:
     """
     Trims the task vector to retain only the top-k% of its elements.
@@ -107,84 +107,46 @@ def trim(
     ----------
     1. Magnitude-based trimming (original TIES):
        - Score = |weight|
-       - Keep weights with largest absolute values
        - Simple but ignores weight sensitivity
 
-    2. SparseGPT importance-based trimming:
+    2. SparseGPT with error correction:
        - Score = weight^2 / (H^-1)^2
-       - Keep weights with highest importance scores
-       - Considers both magnitude and Hessian sensitivity
-
-    Why Trim Task Vectors?
-    ----------------------
-    Task vectors often contain noise and conflicting updates.
-    Trimming keeps only the most important changes, which:
-    - Reduces interference between tasks
-    - Improves merged model performance
-    - Removes low-confidence updates
-
-    Mathematical Comparison:
-    -----------------------
-    TIES (magnitude):
-      score_ij = |τ_ij|
-
-    SparseGPT (importance):
-      score_ij = τ_ij^2 / (H_jj^-1)^2
-      where H_jj^-1 = sensitivity of input feature j
-
-    Key Difference from DARE:
-    -------------------------
-    - DARE: drop_and_rescale (rescales remaining weights)
-    - TIES: trim (no rescaling, just masking)
+       - Blockwise OBS with error propagation to remaining weights
+       - Maintains model quality at high sparsity
 
     Args:
-        task_vector: The task vector to be trimmed
-                    Shape: [out_features, in_features]
-                    Represents: fine_tuned_weights - base_weights
-        density: Fraction of elements to retain (between 0 and 1)
-                0.2 = keep top 20% most important weights
-                0.8 = keep top 80% most important weights
-        hessian_inv_diag: Diagonal of inverse Hessian [in_features]
-                         Required if use_sparsegpt=True
-                         One value per INPUT feature (column)
-        use_sparsegpt: If True, use SparseGPT importance-based trimming
-                      If False, use magnitude-based trimming (default)
+        task_vector: Task vector [out_features, in_features]
+        density: Fraction to retain (0.2 = keep 20%)
+        hessian_inv: FULL inverse Hessian [in_features, in_features]
+                    Required if use_sparsegpt=True (Cholesky factor)
+        use_sparsegpt: If True, use SparseGPT with error correction
+        blocksize: Block size for error correction (memory vs speed tradeoff)
 
     Returns:
-        torch.Tensor: The trimmed task vector (same shape, but sparsified)
-
-    Example:
-    -------
-    task_vec = [[1.0, -2.0, 0.5],
-                [0.3, 1.5, -0.8]]
-    density = 0.5 (keep 50%, drop 50%)
-
-    Magnitude mode:
-    - |values| = [[1.0, 2.0, 0.5], [0.3, 1.5, 0.8]]
-    - threshold = 1.0 (3rd largest)
-    - mask = [[1, 1, 0], [0, 1, 0]]
-    - result = [[1.0, -2.0, 0], [0, 1.5, 0]]
-
-    SparseGPT mode:
-    - importance considers H^-1 diagonal
-    - different weights may be kept
+        Trimmed task vector (same shape, sparsified)
     """
     # Edge case: No trimming needed
     if density >= 1.0:
         return task_vector
 
-    # ========== MODE 1: SparseGPT Importance-Based Trimming ==========
+    # ========== MODE 1: SparseGPT with Error Correction ==========
     if use_sparsegpt:
         if not SPARSEGPT_AVAILABLE:
             raise ImportError(
-                "SparseGPT importance module not available. Install sparsegpt_importance.py"
+                "SparseGPT module not available. Install sparsegpt_task_vector.py"
             )
-        if hessian_inv_diag is None:
-            raise ValueError("hessian_inv_diag is required when use_sparsegpt=True")
+        if hessian_inv is None:
+            raise ValueError(
+                "hessian_inv (full inverse) is required when use_sparsegpt=True"
+            )
 
-        # Delegate to SparseGPT implementation (no rescaling for TIES)
-        return trim_with_sparsegpt_importance(
-            task_vector, hessian_inv_diag, density, rescale=False
+        # Use error-correcting pruning (no rescaling for TIES)
+        return prune_task_vector_with_error_correction(
+            task_vector=task_vector,
+            hessian_inv=hessian_inv,
+            density=density,
+            blocksize=blocksize,
+            rescale=False,  # TIES doesn't rescale
         )
 
     # ========== MODE 2: Magnitude-Based Trimming (Original TIES) ==========
@@ -195,9 +157,7 @@ def trim(
         raise ValueError("Density must be between 0 and 1.")
 
     # STEP 2: Get threshold value for top-k by magnitude
-    # Use absolute value to consider both positive and negative weights
     threshold = torch.topk(task_vector.abs().view(-1), k).values.min()
-    # Example: Keep all weights where |weight| >= threshold
 
     # STEP 3: Create mask for elements to retain
     mask = task_vector.abs() >= threshold
@@ -322,60 +282,39 @@ class TIES:
         ft_models_parameters: List[torch.Tensor],
         densities: List[float],
         device: Optional[torch.device] = None,
-        hessian_inv_diags: Optional[List[torch.Tensor]] = None,
-        importance_masks: Optional[
-            List[torch.Tensor]
-        ] = None,  # NEW: Pre-computed masks
+        hessian_invs: Optional[List[torch.Tensor]] = None,  # Full inverse Hessians
+        importance_masks: Optional[List[torch.Tensor]] = None,  # Pre-computed masks
         use_sparsegpt: bool = False,
+        blocksize: int = 128,  # For error correction
         **kwargs,
     ) -> torch.Tensor:
         """
-        Merges multiple task vectors using the TIES (Trim, Elect, Merge) method.
+        Merges multiple task vectors using TIES (Trim, Elect, Merge) with SparseGPT error correction.
 
-        TIES Algorithm (Yadav et al., 2023):
-        ------------------------------------
-        1. TRIM: Remove low-importance weights from each task vector
-           - Original: Keep top-k by magnitude |τ_i|
-           - SparseGPT: Keep top-k by importance τ_i^2 / (H^-1)^2
+        TIES Algorithm:
+        ---------------
+        1. TRIM: Remove low-importance weights with error correction
+           - Magnitude mode: Keep top-k by |τ_i|
+           - SparseGPT mode: Blockwise OBS with error propagation
 
         2. ELECT: Resolve sign conflicts via majority voting
            - Compute elected sign: sign(Σ τ_i)
-           - Discard updates that disagree with elected sign
+           - Discard updates that disagree
 
         3. MERGE: Weighted average of agreeing updates
            - θ_merged = θ_base + Σ(w_i * τ_i * elect_mask) / Σ(w_i * elect_mask)
 
-        Why TIES Works:
-        --------------
-        - TRIM removes noise and low-confidence updates
-        - ELECT resolves conflicts (prevents cancellation)
-        - MERGE averages only consistent updates
-
-        Result: Better performance than naive averaging, especially with
-        conflicting task vectors.
-
-        Mathematical Formula:
-        --------------------
-        θ_merged[j] = θ_base[j] +
-                      Σ_i (w_i * τ_i[j] * 1_{sign(τ_i[j]) = sign(Σ_k τ_k[j])}) /
-                      Σ_i (w_i * 1_{sign(τ_i[j]) = sign(Σ_k τ_k[j])})
-
         Args:
-            weights: Weights for each task vector (how much to trust each task)
-                    Example: [1.0, 0.5, 1.0] = trust task 1 and 3 equally, task 2 half as much
-            base_model_parameters: The pretrained base model parameters
-                                  Shape: [out_features, in_features] for linear layers
-            ft_models_parameters: List of fine-tuned model parameters (one per task)
-                                 Each has same shape as base_model_parameters
-            densities: List of densities for trimming each task vector
-                      Example: [0.2, 0.2, 0.2] = keep top 20% for all tasks
-                      Can be different per task: [0.1, 0.3, 0.2]
-            device: Device to perform computations on. If None, uses current device
-            hessian_inv_diags: List of inverse Hessian diagonals (one per task)
-                              Required if use_sparsegpt=True
-                              Each has shape [in_features]
-            use_sparsegpt: If True, use SparseGPT importance for TRIM step
-                          If False, use magnitude-based trimming (default)
+            weights: Task weights [1.0, 0.5, ...]
+            base_model_parameters: Pretrained base model parameters
+            ft_models_parameters: List of fine-tuned model parameters
+            densities: Fraction to keep per task [0.2, 0.2, ...]
+            device: Computation device
+            hessian_invs: List of FULL inverse Hessians [in_features, in_features]
+                         (Cholesky factors for error correction)
+            importance_masks: Pre-computed masks (alternative to hessian_invs)
+            use_sparsegpt: If True, use SparseGPT error correction
+            blocksize: Block size for error correction algorithm
 
         Returns:
             torch.Tensor: The merged model parameters
@@ -445,7 +384,7 @@ class TIES:
                 )
 
         # ========== VALIDATE INPUTS FOR SPARSEGPT MODE ==========
-        # Two modes: importance_masks (pre-computed) OR hessian_inv_diags (compute on-the-fly)
+        # Two modes: importance_masks (pre-computed) OR hessian_invs (error correction)
         if use_sparsegpt:
             if importance_masks is not None:
                 # Mode 1: Use pre-computed importance masks
@@ -453,47 +392,47 @@ class TIES:
                     raise ValueError(
                         f"Number of importance_masks ({len(importance_masks)}) must match number of task vectors ({len(task_vectors)})"
                     )
-            elif hessian_inv_diags is not None:
-                # Mode 2: Compute masks from Hessian diagonals
-                if len(hessian_inv_diags) != len(task_vectors):
+            elif hessian_invs is not None:
+                # Mode 2: Error correction with full inverse Hessians
+                if len(hessian_invs) != len(task_vectors):
                     raise ValueError(
-                        f"Number of hessian_inv_diags ({len(hessian_inv_diags)}) must match number of task vectors ({len(task_vectors)})"
+                        f"Number of hessian_invs ({len(hessian_invs)}) must match number of task vectors ({len(task_vectors)})"
                     )
             else:
                 raise ValueError(
-                    "Either importance_masks or hessian_inv_diags is required when use_sparsegpt=True"
+                    "Either importance_masks or hessian_invs (full inverse) is required when use_sparsegpt=True"
                 )
 
         # ========== STEP 1: TRIM TASK VECTORS ==========
-        # Keep only top-k% most important weights in each task vector
+        # Keep only top-k% most important weights with error correction
         if use_sparsegpt and importance_masks is not None:
-            # Mode 1: Apply pre-computed importance masks directly
-            # IMPORTANT: Masks are already computed with correct density, just apply them
+            # Mode 1: Apply pre-computed importance masks
             trimmed_task_vectors = []
             for tv, mask in zip(task_vectors, importance_masks):
-                # Ensure mask is same shape as task vector
                 if mask.numel() == tv.numel():
                     mask_reshaped = mask.reshape(tv.shape)
                 else:
                     raise ValueError(
                         f"Mask size ({mask.numel()}) doesn't match task vector size ({tv.numel()})"
                     )
-                # Apply mask (mask is float, 0.0 or 1.0)
                 trimmed_task_vectors.append(tv * mask_reshaped)
-        elif use_sparsegpt and hessian_inv_diags is not None:
-            # Mode 2: SparseGPT mode with Hessian - compute importance on-the-fly
+        elif use_sparsegpt and hessian_invs is not None:
+            # Mode 2: SparseGPT error correction with full inverse Hessians
             trimmed_task_vectors = [
-                trim(tv, density, hessian_inv_diag=h_inv, use_sparsegpt=True)
-                for tv, density, h_inv in zip(
-                    task_vectors, densities, hessian_inv_diags
+                trim(
+                    tv,
+                    density,
+                    hessian_inv=h_inv,
+                    use_sparsegpt=True,
+                    blocksize=blocksize,
                 )
+                for tv, density, h_inv in zip(task_vectors, densities, hessian_invs)
             ]
         else:
             # Magnitude mode: importance = |τ|
             trimmed_task_vectors = [
                 trim(tv, density) for tv, density in zip(task_vectors, densities)
             ]
-        # trimmed_task_vectors: list of sparse task vectors
 
         # ========== STEP 2: STACK FOR VECTORIZED OPERATIONS ==========
         # Convert list to tensor for efficient computation

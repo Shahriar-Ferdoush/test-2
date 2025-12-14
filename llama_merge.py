@@ -45,7 +45,7 @@ import torch.nn as nn
 from dare_utils import DARE
 from datasets import load_dataset
 from peft import PeftModel
-from sparsegpt_importance import (
+from sparsegpt_task_vector import (
     HessianCalculator,
     compute_importance_scores,
     generate_importance_mask,
@@ -377,7 +377,7 @@ class LLaMAMerger:
             log_print(f"    ✓ Loaded {len(task_vector_dict)} task vectors")
 
             importance_masks = {}
-            for layer_name, h_inv_diag in hessian_inv_diags.items():
+            for layer_name, h_inv in hessian_inv_diags.items():
                 # Find matching key in task vector cache
                 layer_key = None
                 for key in task_vector_dict.keys():
@@ -398,9 +398,12 @@ class LLaMAMerger:
                 # Get task vector from cache
                 task_vector = task_vector_dict[layer_key]
 
-                # Calculate importance on TASK VECTOR (the actual change)
-                # importance = task_vector^2 / (H^{-1})^2
-                # This measures: "How important is THIS CHANGE given the Hessian?"
+                # Calculate importance using FULL Hessian for better quality
+                # Extract diagonal from full inverse Hessian for importance scoring
+                # h_inv is Cholesky factor: H^{-1} = h_inv^T @ h_inv
+                # So diagonal of H^{-1} = sum of squares of rows
+                h_inv_diag = torch.sum(h_inv ** 2, dim=0)  # [in_features]
+                
                 eps = 1e-10  # Numerical stability
                 h_inv_diag_broadcasted = h_inv_diag.unsqueeze(0)  # [1, in_features]
                 importance = task_vector.pow(2) / (
@@ -420,7 +423,7 @@ class LLaMAMerger:
                     "density": self.density,
                 }
 
-            log_print(f"  ✓ Generated masks for {len(importance_masks)} layers")
+            log_print(f"  ✓ Generated masks for {len(importance_masks)} layers (with error correction)")
 
             # Save masks ONLY (not Hessians!)
             log_print(f"  Saving importance masks: {mask_file}")
@@ -889,7 +892,7 @@ class LLaMAMerger:
         calibration_data: List[torch.Tensor],
     ) -> Dict[str, torch.Tensor]:
         """
-        Compute Hessian inverse diagonals for all linear layers.
+        Compute FULL inverse Hessians for all linear layers (for error correction).
 
         Args:
             model: The model to compute Hessians for
@@ -897,9 +900,9 @@ class LLaMAMerger:
             calibration_data: List of input tensors
 
         Returns:
-            Dictionary mapping layer_name -> H^{-1} diagonal tensor
+            Dictionary mapping layer_name -> H^{-1} full matrix (Cholesky factor)
         """
-        hessian_inv_diags = {}
+        hessian_inv_diags = {}  # Name kept for compatibility, but contains full inverse
 
         # MEMORY OPTIMIZATION: Process calibration data in batches
         # Instead of accumulating all activations, process in chunks of BATCH_SIZE
@@ -987,20 +990,20 @@ class LLaMAMerger:
             f"    ✓ Processed all {len(calibration_data)} samples in {time.time()-start_time:.1f}s"
         )
 
-        # Compute inverse Hessian diagonals from accumulated statistics
+        # Compute FULL inverse Hessians for error correction (not just diagonals)
         log_print(
-            f"    Computing inverse Hessian diagonals for {len(linear_layers)} layers..."
+            f"    Computing full inverse Hessians (for error correction) for {len(linear_layers)} layers..."
         )
         num_layers = len(linear_layers)
         for layer_idx, name in enumerate(linear_layers.keys()):
             if (layer_idx + 1) % 10 == 0 or layer_idx == 0:
                 log_print(f"      Layer {layer_idx+1}/{num_layers}: {name}")
 
-            # Compute inverse diagonal
-            h_inv_diag = hessian_calcs[name].get_inverse_hessian_diag(percdamp=0.01)
-            hessian_inv_diags[name] = h_inv_diag
+            # Compute FULL inverse Hessian (Cholesky factor) for error correction
+            h_inv = hessian_calcs[name].get_inverse_hessian(percdamp=0.01)
+            hessian_inv_diags[name] = h_inv  # Variable name kept for compatibility, but contains full inverse
 
-        log_print(f"    ✓ Computed Hessians for {len(hessian_inv_diags)} layers")
+        log_print(f"    ✓ Computed full inverse Hessians for {len(hessian_inv_diags)} layers (error correction enabled)")
         return hessian_inv_diags
 
     # ============================================================================

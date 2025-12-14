@@ -1,14 +1,14 @@
 from typing import List, Optional
 
 import torch
+
 from ties_utils import get_task_vector
 
 try:
-    from sparsegpt_importance import (
-        apply_importance_mask,
+    from sparsegpt_task_vector import (
         compute_importance_scores,
-        drop_and_rescale_with_sparsegpt_importance,
         generate_importance_mask,
+        prune_task_vector_with_error_correction,
     )
 
     SPARSEGPT_AVAILABLE = True
@@ -16,99 +16,65 @@ except ImportError:
     SPARSEGPT_AVAILABLE = False
     import warnings
 
-    warnings.warn(
-        "SparseGPT importance module not found. Falling back to random dropout."
-    )
+    warnings.warn("SparseGPT module not found. Falling back to random dropout.")
 
 
 def drop_and_rescale(
     task_vector: torch.Tensor,
     density: float,
     rescale: bool = True,
-    hessian_inv_diag: Optional[torch.Tensor] = None,
+    hessian_inv: Optional[torch.Tensor] = None,
     use_sparsegpt: bool = False,
+    blocksize: int = 128,
 ) -> torch.Tensor:
     """
-    DARE (Drop And REscale) method: Drops weights based on importance and rescales remaining weights.
+    DARE (Drop And REscale): Drops weights with error correction and rescales.
 
     Two Modes:
     ----------
     1. Random dropout (original DARE):
-       - Uses Bernoulli sampling (random coin flip per weight)
-       - Fast but ignores weight importance
+       - Bernoulli sampling
+       - Fast but ignores importance
 
-    2. SparseGPT importance-based dropout:
-       - Uses Hessian-based importance: w^2 / (H^-1)^2
-       - Keeps top-k most important weights
-       - More principled than random dropout
-
-    Mathematical Justification (DARE Paper):
-    ----------------------------------------
-    Even if we drop >90% of weight updates and rescale by 1/density,
-    the merged model performance doesn't degrade significantly.
-
-    Why? Task vectors are often redundant - only a small fraction
-    of updates are critical for performance.
-
-    Rescaling Formula:
-    -----------------
-    masked_weight = weight * mask / density
-
-    This preserves expected magnitude:
-    E[masked_weight] = weight * E[mask] / density
-                     = weight * density / density
-                     = weight
+    2. SparseGPT with error correction:
+       - Blockwise OBS with error propagation
+       - Maintains quality at high sparsity
 
     Args:
-        task_vector: The task vector to be trimmed
-                    Shape: typically [out_features, in_features]
-                    Represents: fine_tuned_weights - base_weights
-        density: The density level for trimming (between 0 and 1)
-                0.2 = keep 20% of weights, drop 80%
-                0.8 = keep 80% of weights, drop 20%
-        rescale: Whether to rescale the remaining weights by 1/density
-                True (default) = preserve magnitude
-                False = just mask without rescaling
-        hessian_inv_diag: Diagonal of inverse Hessian [in_features]
-                         Required if use_sparsegpt=True
-                         One value per INPUT feature (column)
-        use_sparsegpt: If True, use SparseGPT importance-based dropping
-                      If False, use random dropout (default)
+        task_vector: Task vector [out_features, in_features]
+        density: Fraction to keep (0.2 = 20%)
+        rescale: If True, scale by 1/density (DARE default)
+        hessian_inv: FULL inverse Hessian [in_features, in_features]
+                    Required if use_sparsegpt=True
+        use_sparsegpt: If True, use error correction
+        blocksize: Block size for error correction
 
     Returns:
-        torch.Tensor: The trimmed (and possibly rescaled) task vector
-
-    Example:
-    -------
-    task_vec = [1.0, 2.0, 3.0, 4.0]
-    density = 0.5
-
-    Random mode:
-    - mask = [1, 0, 1, 0] (random)
-    - result = [1.0/0.5, 0, 3.0/0.5, 0] = [2.0, 0, 6.0, 0]
-
-    SparseGPT mode:
-    - importance = [0.1, 0.5, 0.3, 0.8]
-    - mask = [0, 1, 0, 1] (top 2)
-    - result = [0, 2.0/0.5, 0, 4.0/0.5] = [0, 4.0, 0, 8.0]
+        Dropped and rescaled task vector
     """
 
     # Edge case: No dropout needed
     if density >= 1.0:
         return task_vector
 
-    # ========== MODE 1: SparseGPT Importance-Based Dropout ==========
+    # ========== MODE 1: SparseGPT with Error Correction ==========
     if use_sparsegpt:
         if not SPARSEGPT_AVAILABLE:
             raise ImportError(
-                "SparseGPT importance module not available. Install sparsegpt_importance.py"
+                "SparseGPT module not available. Install sparsegpt_task_vector.py"
             )
-        if hessian_inv_diag is None:
-            raise ValueError("hessian_inv_diag is required when use_sparsegpt=True")
+        if hessian_inv is None:
+            raise ValueError(
+                "hessian_inv (full inverse) is required when use_sparsegpt=True"
+            )
 
-        # Delegate to SparseGPT implementation
-        return drop_and_rescale_with_sparsegpt_importance(
-            task_vector, hessian_inv_diag, density, rescale
+        # Use error-correcting pruning with rescaling
+        return prune_task_vector_with_error_correction(
+            task_vector=task_vector,
+            hessian_inv=hessian_inv,
+            density=density,
+            blocksize=blocksize,
+            rescale=rescale,  # DARE rescales
         )
 
     # ========== MODE 2: Random Dropout (Original DARE) ==========
@@ -149,28 +115,28 @@ class DARE:
         ft_models_parameters: List[torch.Tensor],
         densities: List[float],
         device: Optional[torch.device] = None,
-        hessian_inv_diags: Optional[List[torch.Tensor]] = None,
-        importance_masks: Optional[
-            List[torch.Tensor]
-        ] = None,  # NEW: Pre-computed masks
+        hessian_invs: Optional[List[torch.Tensor]] = None,  # Full inverse Hessians
+        importance_masks: Optional[List[torch.Tensor]] = None,  # Pre-computed masks
         use_sparsegpt: bool = False,
+        blocksize: int = 128,  # For error correction
         **kwargs,
     ) -> torch.Tensor:
         """
-        Merges multiple task vectors into a single parameter update using the DARE method.
+        Merges task vectors using DARE with SparseGPT error correction.
 
         Args:
-            weights (List[float]): Weights for each task vector.
-            base_model_parameters (torch.Tensor): The parameters of the base model.
-            ft_models_parameters (List[torch.Tensor]): List of parameters from different adapted models.
-            densities (List[float]): List of densities for trimming each task vector.
-            device (torch.device, optional): Device to perform computations on. If None, uses current device.
-            hessian_inv_diags (Optional[List[torch.Tensor]]): List of inverse Hessian diagonals for each task vector.
-                                                                Required if use_sparsegpt=True.
-            use_sparsegpt (bool): If True, use SparseGPT importance-based dropping instead of random dropout.
+            weights: Task weights [1.0, 0.5, ...]
+            base_model_parameters: Base model parameters
+            ft_models_parameters: List of fine-tuned parameters
+            densities: Fraction to keep [0.2, 0.2, ...]
+            device: Computation device
+            hessian_invs: List of FULL inverse Hessians [in_features, in_features]
+            importance_masks: Pre-computed masks (alternative)
+            use_sparsegpt: If True, use error correction
+            blocksize: Block size for error correction
 
         Returns:
-            torch.Tensor: The merged model parameters after applying the DARE method.
+            Merged model parameters
         """
         if device is None:
             device = base_model_parameters.device
@@ -215,54 +181,50 @@ class DARE:
                     raise ValueError(
                         f"Number of importance_masks ({len(importance_masks)}) must match number of task vectors ({len(task_vectors)})"
                     )
-            elif hessian_inv_diags is not None:
-                if len(hessian_inv_diags) != len(task_vectors):
+            elif hessian_invs is not None:
+                if len(hessian_invs) != len(task_vectors):
                     raise ValueError(
-                        f"Number of hessian_inv_diags ({len(hessian_inv_diags)}) must match number of task vectors ({len(task_vectors)})"
+                        f"Number of hessian_invs ({len(hessian_invs)}) must match number of task vectors ({len(task_vectors)})"
                     )
             else:
                 raise ValueError(
-                    "Either importance_masks or hessian_inv_diags is required when use_sparsegpt=True"
+                    "Either importance_masks or hessian_invs (full inverse) is required when use_sparsegpt=True"
                 )
 
-        # Trim task vectors based on densities
+        # Trim task vectors with error correction
         if use_sparsegpt and importance_masks is not None:
-            # Apply pre-computed importance masks
+            # Apply pre-computed masks with rescaling
             trimmed_task_vectors = []
             for tv, mask in zip(task_vectors, importance_masks):
-                # Ensure mask is same shape as task vector
                 if mask.numel() == tv.numel():
                     mask_reshaped = mask.reshape(tv.shape)
                 else:
                     raise ValueError(
                         f"Mask size ({mask.numel()}) doesn't match task vector size ({tv.numel()})"
                     )
-                # Apply mask and rescale (DARE rescales by 1/density)
-                # Since mask already represents top-k selection, we need to
-                # rescale only the non-zero elements
                 masked_tv = tv * mask_reshaped
-                # Count non-zero elements to compute actual density
+                # DARE rescaling
                 non_zero_count = (mask_reshaped != 0).sum().item()
                 actual_density = non_zero_count / mask_reshaped.numel()
                 if actual_density > 0:
-                    # Rescale to preserve magnitude
                     trimmed_task_vectors.append(masked_tv / actual_density)
                 else:
                     trimmed_task_vectors.append(masked_tv)
-        elif use_sparsegpt and hessian_inv_diags is not None:
+        elif use_sparsegpt and hessian_invs is not None:
+            # Error correction with full inverse Hessians
             trimmed_task_vectors = [
                 drop_and_rescale(
                     tv,
                     density,
                     rescale=True,
-                    hessian_inv_diag=h_inv,
+                    hessian_inv=h_inv,
                     use_sparsegpt=True,
+                    blocksize=blocksize,
                 )
-                for tv, density, h_inv in zip(
-                    task_vectors, densities, hessian_inv_diags
-                )
+                for tv, density, h_inv in zip(task_vectors, densities, hessian_invs)
             ]
         else:
+            # Random dropout (original DARE)
             trimmed_task_vectors = [
                 drop_and_rescale(tv, density)
                 for tv, density in zip(task_vectors, densities)
