@@ -40,18 +40,18 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
+from datasets import load_dataset
+from peft import PeftModel
+from transformers import AutoModelForCausalLM, AutoTokenizer, LlamaForCausalLM
 
 # Import our merging utilities
 from dare_utils import DARE
-from datasets import load_dataset
-from peft import PeftModel
 from sparsegpt_task_vector import (
     HessianCalculator,
     compute_importance_scores,
     generate_importance_mask,
 )
 from ties_utils import TIES
-from transformers import AutoModelForCausalLM, AutoTokenizer, LlamaForCausalLM
 
 # Configure logging
 logging.basicConfig(
@@ -402,8 +402,8 @@ class LLaMAMerger:
                 # Extract diagonal from full inverse Hessian for importance scoring
                 # h_inv is Cholesky factor: H^{-1} = h_inv^T @ h_inv
                 # So diagonal of H^{-1} = sum of squares of rows
-                h_inv_diag = torch.sum(h_inv ** 2, dim=0)  # [in_features]
-                
+                h_inv_diag = torch.sum(h_inv**2, dim=0)  # [in_features]
+
                 eps = 1e-10  # Numerical stability
                 h_inv_diag_broadcasted = h_inv_diag.unsqueeze(0)  # [1, in_features]
                 importance = task_vector.pow(2) / (
@@ -423,7 +423,9 @@ class LLaMAMerger:
                     "density": self.density,
                 }
 
-            log_print(f"  ✓ Generated masks for {len(importance_masks)} layers (with error correction)")
+            log_print(
+                f"  ✓ Generated masks for {len(importance_masks)} layers (with error correction)"
+            )
 
             # Save masks ONLY (not Hessians!)
             log_print(f"  Saving importance masks: {mask_file}")
@@ -1001,9 +1003,13 @@ class LLaMAMerger:
 
             # Compute FULL inverse Hessian (Cholesky factor) for error correction
             h_inv = hessian_calcs[name].get_inverse_hessian(percdamp=0.01)
-            hessian_inv_diags[name] = h_inv  # Variable name kept for compatibility, but contains full inverse
+            hessian_inv_diags[name] = (
+                h_inv  # Variable name kept for compatibility, but contains full inverse
+            )
 
-        log_print(f"    ✓ Computed full inverse Hessians for {len(hessian_inv_diags)} layers (error correction enabled)")
+        log_print(
+            f"    ✓ Computed full inverse Hessians for {len(hessian_inv_diags)} layers (error correction enabled)"
+        )
         return hessian_inv_diags
 
     # ============================================================================
@@ -1048,9 +1054,13 @@ class LLaMAMerger:
             cached_mask_dicts = []
             for idx in range(len(self.finetuned_model_paths)):
                 mask_file = self.mask_dir / f"importance_mask_{idx}.pt"
-                mask_dict = torch.load(mask_file, map_location="cpu", weights_only=False)
+                mask_dict = torch.load(
+                    mask_file, map_location="cpu", weights_only=False
+                )
                 cached_mask_dicts.append(mask_dict)
-                logger.info(f"  Loaded mask file {idx}: {mask_file.name} ({len(mask_dict)} layers)")
+                logger.info(
+                    f"  Loaded mask file {idx}: {mask_file.name} ({len(mask_dict)} layers)"
+                )
 
         # Merge layer by layer
         log_print(f"\nMerging {len(layer_names)} layers...")
@@ -1104,7 +1114,9 @@ class LLaMAMerger:
                             else:
                                 dense_mask = mask_data
                             # Move to device
-                            dense_mask = dense_mask.to(dtype=torch.float32, device=model_device)
+                            dense_mask = dense_mask.to(
+                                dtype=torch.float32, device=model_device
+                            )
 
                         importance_masks.append(dense_mask)
                     else:
@@ -1251,9 +1263,13 @@ class LLaMAMerger:
             cached_mask_dicts = []
             for idx in range(len(self.finetuned_model_paths)):
                 mask_file = self.mask_dir / f"importance_mask_{idx}.pt"
-                mask_dict = torch.load(mask_file, map_location="cpu", weights_only=False)
+                mask_dict = torch.load(
+                    mask_file, map_location="cpu", weights_only=False
+                )
                 cached_mask_dicts.append(mask_dict)
-                logger.info(f"  Loaded mask file {idx}: {mask_file.name} ({len(mask_dict)} layers)")
+                logger.info(
+                    f"  Loaded mask file {idx}: {mask_file.name} ({len(mask_dict)} layers)"
+                )
 
         # Merge layer by layer
         log_print(f"\nMerging {len(layer_names)} layers...")
@@ -1307,7 +1323,9 @@ class LLaMAMerger:
                             else:
                                 dense_mask = mask_data
                             # Move to device
-                            dense_mask = dense_mask.to(dtype=torch.float32, device=model_device)
+                            dense_mask = dense_mask.to(
+                                dtype=torch.float32, device=model_device
+                            )
 
                         importance_masks.append(dense_mask)
                     else:
