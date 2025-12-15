@@ -346,12 +346,10 @@ def prune_task_vector_with_error_correction(
     Hinv = hessian_inv.float()
 
     # Extract diagonal of H^(-1) for importance scoring
-    # Hinv is upper triangular Cholesky factor: H^(-1) = Hinv^T @ Hinv
-    # For upper triangular Cholesky: diag(H^(-1)) = diag(Hinv)^2
-    # But we need the actual H^(-1) diagonal for proper scaling
-    # Compute full H^(-1) diagonal from Cholesky factor
-    Hinv_full = Hinv.t() @ Hinv  # Reconstruct H^(-1) from Cholesky factor
-    Hinv_diag = torch.diag(Hinv_full)  # [columns]
+    # Hinv is upper triangular Cholesky factor: H^(-1) = Hinv^T @ Hinv.
+    # We must NOT materialize H^(-1) (O(n^2) memory, O(n^3) compute).
+    # diag(H^(-1)) = diag(Hinv^T @ Hinv) = sum_k Hinv[k, i]^2.
+    Hinv_diag = torch.sum(Hinv * Hinv, dim=0)  # [columns]
 
     # Compute importance scores for entire weight matrix
     importance = compute_importance_scores(W, Hinv_diag, eps=1e-10)
@@ -391,22 +389,18 @@ def prune_task_vector_with_error_correction(
         # === Process each column in block ===
         for i in range(count):
             w = W1[:, i]  # Current column [rows]
-            d = torch.diag(Hinv1)[i]  # Diagonal element of Hinv (Cholesky factor)
-
-            # CRITICAL FIX: For proper scaling, use the actual H^(-1) diagonal
-            # But for error propagation structure, use Cholesky diagonal
-            # Reconstruct the proper inverse diagonal element
-            d_inv = Hinv_diag[i1 + i]  # Actual H^(-1)_ii
+            d = Hinv1[i, i]  # Diagonal element of Hinv (Cholesky factor)
 
             # Apply mask to get pruned weights
             q = w.clone()
-            q[~mask1[:, i]] = 0  # Zero out pruned weights (where mask=False)
+            keep = mask1[:, i] > 0
+            q[~keep] = 0  # Zero out pruned weights
 
             # Store pruned weights
             Q1[:, i] = q
 
-            # Track reconstruction error
-            Losses1[:, i] = (w - q) ** 2 / (d_inv**2 + 1e-10)
+            # Track reconstruction error (matches reference implementation structure)
+            Losses1[:, i] = (w - q) ** 2 / (d**2 + 1e-10)
 
             # === ERROR CORRECTION (key innovation!) ===
             # Compute scaled error using CHOLESKY diagonal (not H^(-1) diagonal)
@@ -503,25 +497,35 @@ class TaskVectorImportanceCalculator:
             layer_names: List of layer names (e.g., ['model.layers.0.self_attn.q_proj'])
             verbose: Print progress
         """
-        # Register forward hooks to capture inputs
+        # Register forward hooks to accumulate Hessians online (avoid storing activations).
         hooks = []
-        inputs_captured = {name: [] for name in layer_names}
+        calculators: Dict[str, HessianCalculator] = {}
 
-        def make_hook(name):
-            def hook(module, inp, out):
-                # Capture input activations
-                inputs_captured[name].append(inp[0].detach().cpu())
-
-            return hook
-
-        # Attach hooks
         for name in layer_names:
             layer = self._get_layer_by_name(name)
             if layer is None:
                 warnings.warn(f"Layer {name} not found")
                 continue
-            hook = layer.register_forward_hook(make_hook(name))
-            hooks.append(hook)
+            if not hasattr(layer, "weight"):
+                warnings.warn(f"Layer {name} has no weight attribute")
+                continue
+
+            calc = HessianCalculator(layer.weight.shape, device=self.device)
+            calculators[name] = calc
+
+            def make_hook(calc_ref: HessianCalculator, lname: str):
+                def hook(module, inp, out):
+                    if inp is None or len(inp) == 0:
+                        return
+                    x = inp[0]
+                    if not torch.is_tensor(x):
+                        return
+                    # Keep on-device, detach from graph
+                    calc_ref.add_batch(x.detach())
+
+                return hook
+
+            hooks.append(layer.register_forward_hook(make_hook(calc, name)))
 
         # Run calibration data through model
         if verbose:
@@ -545,31 +549,10 @@ class TaskVectorImportanceCalculator:
         for hook in hooks:
             hook.remove()
 
-        # Compute Hessians from captured inputs
-        for name in layer_names:
-            if name not in inputs_captured or len(inputs_captured[name]) == 0:
-                warnings.warn(f"No inputs captured for layer {name}")
-                continue
-
+        # Store calculators and compute inverses
+        for name, calc in calculators.items():
             if verbose:
                 print(f"Processing layer: {name}")
-
-            # Get layer shape
-            layer = self._get_layer_by_name(name)
-            if hasattr(layer, "weight"):
-                layer_shape = layer.weight.shape
-            else:
-                warnings.warn(f"Layer {name} has no weight attribute")
-                continue
-
-            # Initialize Hessian calculator
-            calc = HessianCalculator(layer_shape, device=self.device)
-
-            # Add all captured batches
-            for inp in inputs_captured[name]:
-                calc.add_batch(inp.to(self.device))
-
-            # Store calculator and compute inverses
             self.hessian_calculators[name] = calc
             self.hessian_inv_diags[name] = calc.get_inverse_hessian_diag(self.percdamp)
             self.hessian_invs[name] = calc.get_inverse_hessian(self.percdamp)
