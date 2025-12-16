@@ -61,21 +61,34 @@ class HessianCalculator:
         Args:
             inp: Input activations [batch, seq_len, in_features] or [batch, in_features]
         """
-        # Ensure 2D: [tokens, in_features]
+        # Ensure input has batch dimension
         if len(inp.shape) == 2:
-            inp = inp.unsqueeze(0)
+            inp = inp.unsqueeze(0)  # [features] -> [1, features]
+
+        # Number of samples in this batch (batch_size or batch*seq_len)
+        tmp = inp.shape[0]
+
+        # Reshape to [tokens, in_features] if 3D
         if len(inp.shape) == 3:
-            inp = inp.reshape(-1, inp.shape[-1])  # [batch*seq_len, in_features]
+            # [batch, seq_len, features] -> [batch*seq_len, features]
+            inp = inp.reshape((-1, inp.shape[-1]))
 
-        tmp = inp.shape[0]  # Number of tokens in this batch
+        # Transpose: [tokens, features] -> [features, tokens]
+        # Now each row is one feature, each column is one token
+        inp = inp.t()
 
-        # Running average update: scale old Hessian by its weight
+        # === Running average update for Hessian ===
+        # Scale old Hessian by its weight in the new average
         self.H *= self.nsamples / (self.nsamples + tmp)
+        # Update total token count
         self.nsamples += tmp
 
-        # Normalize and add covariance: H += (2/n) * X^T * X
+        # Normalize input (factor of sqrt(2/n) for numerical stability)
         inp = math.sqrt(2 / self.nsamples) * inp.float()
-        self.H += inp.t() @ inp  # [in_features, in_features]
+
+        # Add covariance of this batch: H += X @ X^T
+        # H[i,j] accumulates sum of (feature_i * feature_j) over all tokens
+        self.H += inp.matmul(inp.t())
 
         # Validate Hessian (catch numerical issues in calibration data)
         if torch.isnan(self.H).any():
@@ -100,22 +113,26 @@ class HessianCalculator:
         Returns:
             Diagonal elements [in_features]
         """
-        H = self.H.clone()
+        # Work in float32 for numerical precision (matching sparsegpt.py)
+        H = self.H.clone().float()
 
-        # Handle dead features (never activated)
-        dead = torch.diag(H) == 0
-        H[dead, dead] = 1
+        # === Handle dead neurons (features never activated) ===
+        dead = torch.diag(H) == 0  # Diagonal = 0 means feature never varied
+        H[dead, dead] = 1  # Set to 1 to avoid division by zero
 
-        # Add dampening for numerical stability
-        damp = percdamp * torch.mean(torch.diag(H))
-        diag_indices = torch.arange(self.columns, device=self.device)
-        H[diag_indices, diag_indices] += damp
+        # === Add dampening to Hessian diagonal for numerical stability ===
+        # Dampening prevents issues when Hessian is near-singular
+        damp = percdamp * torch.mean(torch.diag(H))  # percdamp of average diagonal
+        diag = torch.arange(self.columns, device=self.device)
+        H[diag, diag] += damp  # H_ii += damp for all i
 
-        # Inverse via Cholesky: H = L @ L^T => H^(-1) = L^(-T) @ L^(-1)
+        # === Compute inverse Hessian using Cholesky decomposition ===
         try:
-            L = torch.linalg.cholesky(H)
-            H_inv = torch.cholesky_inverse(L)
-            H_inv_diag = torch.diag(H_inv)
+            # Step 1: Cholesky decomposition H = L @ L^T
+            H = torch.linalg.cholesky(H)
+            # Step 2: Compute (L @ L^T)^{-1} = L^{-T} @ L^{-1}
+            H = torch.cholesky_inverse(H)
+            H_inv_diag = torch.diag(H)
 
             # Validate result
             if torch.isnan(H_inv_diag).any() or torch.isinf(H_inv_diag).any():
@@ -125,7 +142,7 @@ class HessianCalculator:
         except (RuntimeError, ValueError) as e:
             # Fallback to diagonal approximation if Cholesky fails
             warnings.warn(f"Cholesky failed ({e}), using diagonal approximation")
-            diag_inv = 1.0 / (torch.diag(H) + 1e-10)
+            diag_inv = 1.0 / (torch.diag(self.H) + 1e-10)
             return diag_inv
 
     def get_inverse_hessian(self, percdamp: float = 0.01) -> torch.Tensor:
@@ -142,43 +159,39 @@ class HessianCalculator:
             Upper triangular matrix [in_features, in_features]
             Represents Cholesky factor U where H^(-1) = U^T @ U
         """
-        H = self.H.clone()
+        # Work in float32 for numerical precision (matching sparsegpt.py)
+        H = self.H.clone().float()
 
-        # Handle dead features
-        dead = torch.diag(H) == 0
-        H[dead, dead] = 1
+        # === Handle dead neurons (features never activated) ===
+        dead = torch.diag(H) == 0  # Diagonal = 0 means feature never varied
+        H[dead, dead] = 1  # Set to 1 to avoid division by zero
 
-        # Add dampening
-        damp = percdamp * torch.mean(torch.diag(H))
-        diag_indices = torch.arange(self.columns, device=self.device)
-        H[diag_indices, diag_indices] += damp
+        # === Add dampening to Hessian diagonal for numerical stability ===
+        # Dampening prevents issues when Hessian is near-singular
+        damp = percdamp * torch.mean(torch.diag(H))  # percdamp of average diagonal
+        diag = torch.arange(self.columns, device=self.device)
+        H[diag, diag] += damp  # H_ii += damp for all i
 
-        # Cholesky decomposition: H = L @ L^T
+        # === Compute inverse Hessian using Cholesky decomposition ===
         try:
-            L = torch.linalg.cholesky(H)
-            # Inverse: H^(-1) = L^(-T) @ L^(-1)
-            H_inv = torch.cholesky_inverse(L)
-
-            # Validate H_inv before computing its Cholesky
-            if torch.isnan(H_inv).any() or torch.isinf(H_inv).any():
-                raise ValueError(
-                    f"NaN/Inf in H_inv: NaN={torch.isnan(H_inv).sum()}, "
-                    f"Inf={torch.isinf(H_inv).sum()}"
-                )
-
-            # Return Cholesky factor of inverse (upper triangular for efficiency)
-            H_inv_chol = torch.linalg.cholesky(H_inv, upper=True)
+            # Step 1: Cholesky decomposition H = L @ L^T
+            H = torch.linalg.cholesky(H)
+            # Step 2: Compute (L @ L^T)^{-1} = L^{-T} @ L^{-1}
+            H = torch.cholesky_inverse(H)
+            # Step 3: Cholesky of inverse (for numerical efficiency later)
+            H = torch.linalg.cholesky(H, upper=True)
+            Hinv = H  # Hinv is now the Cholesky factor of H^{-1}
 
             # Final validation
-            if torch.isnan(H_inv_chol).any() or torch.isinf(H_inv_chol).any():
+            if torch.isnan(Hinv).any() or torch.isinf(Hinv).any():
                 raise ValueError("NaN/Inf in Cholesky factor of H_inv")
 
-            return H_inv_chol
+            return Hinv
         except (RuntimeError, ValueError) as e:
             raise ValueError(
                 f"Failed to compute inverse Hessian: {e}. "
-                f"Hessian condition: min_diag={torch.diag(H).min():.2e}, "
-                f"max_diag={torch.diag(H).max():.2e}, mean={torch.diag(H).mean():.2e}"
+                f"Hessian condition: min_diag={torch.diag(self.H).min():.2e}, "
+                f"max_diag={torch.diag(self.H).max():.2e}, mean={torch.diag(self.H).mean():.2e}"
             )
 
 
@@ -210,10 +223,12 @@ def compute_importance_scores(
         return importance
 
     # Handle 2D weights (linear layers)
+    # Match sparsegpt.py exactly: W**2 / (diag.reshape((1, -1)))**2
     elif len(original_shape) == 2:
-        # Broadcast H_inv_diag across output dimension
-        # Each input feature j has one H_jj^-1 value applied to all output neurons
-        importance = weights**2 / ((hessian_inv_diag.unsqueeze(0) + eps) ** 2)
+        # Compute pruning scores: w^2 / H_ii^2
+        # Higher score = more important weight (keep it)
+        # Lower score = less important (prune it)
+        importance = weights**2 / (hessian_inv_diag.reshape((1, -1)) + eps) ** 2
         return importance
 
     # Handle higher-dimensional weights (conv layers)
@@ -225,7 +240,7 @@ def compute_importance_scores(
         spatial_size = flat_weights.shape[1] // in_features
         expanded_hessian = hessian_inv_diag.repeat_interleave(spatial_size)
 
-        importance = flat_weights**2 / ((expanded_hessian.unsqueeze(0) + eps) ** 2)
+        importance = flat_weights**2 / ((expanded_hessian.reshape((1, -1)) + eps) ** 2)
         importance = importance.reshape(original_shape)
         return importance
 
@@ -341,90 +356,85 @@ def prune_task_vector_with_error_correction(
     device = task_vector.device
     dtype = task_vector.dtype
 
-    # Work in float32 for numerical precision
+    # Work in float32 for numerical precision (matching sparsegpt.py)
     W = task_vector.clone().float()
     Hinv = hessian_inv.float()
 
-    # Extract diagonal of H^(-1) for importance scoring
-    # Hinv is upper triangular Cholesky factor: H^(-1) = Hinv^T @ Hinv.
-    # We must NOT materialize H^(-1) (O(n^2) memory, O(n^3) compute).
-    # diag(H^(-1)) = diag(Hinv^T @ Hinv) = sum_k Hinv[k, i]^2.
-    Hinv_diag = torch.sum(Hinv * Hinv, dim=0)  # [columns]
+    # Note: Dead neuron handling (W[:, dead] = 0) is done in get_inverse_hessian()
+    # where dead neurons are identified from H diagonal. For task vectors,
+    # dead features should naturally have near-zero weights and low importance.
 
-    # Compute importance scores for entire weight matrix
-    importance = compute_importance_scores(W, Hinv_diag, eps=1e-10)
-
-    # Generate pruning mask (1 = keep, 0 = prune)
-    mask = generate_importance_mask(importance, density)
-
-    # Validate Hessian diagonal (catch numerical issues early)
-    if torch.isnan(Hinv_diag).any() or torch.isinf(Hinv_diag).any():
-        raise ValueError(
-            f"Invalid Hessian diagonal: NaN={torch.isnan(Hinv_diag).sum()}, "
-            f"Inf={torch.isinf(Hinv_diag).sum()}"
-        )
-
-    # === Blockwise pruning with error correction ===
-    # Following original SparseGPT algorithm exactly
+    # Track reconstruction losses per output neuron
     Losses = torch.zeros(rows, device=device)
 
+    # Global pruning mask (None for unstructured pruning)
+    mask = None
+
+    # === Process weights in blocks (columns of W) ===
+    # Processing blocksize columns at a time reduces memory usage
     for i1 in range(0, columns, blocksize):
-        i2 = min(i1 + blocksize, columns)
-        count = i2 - i1
+        i2 = min(i1 + blocksize, columns)  # End of block
+        count = i2 - i1  # Number of columns in this block
 
         # Extract block of weights [rows, blocksize]
         W1 = W[:, i1:i2].clone()
 
-        # Pruned weights (Q1), errors (Err1) for this block
+        # Q1 will store pruned/quantized weights
         Q1 = torch.zeros_like(W1)
+        # Err1 stores reconstruction errors for error propagation
         Err1 = torch.zeros_like(W1)
+        # Losses1 tracks reconstruction loss per weight
         Losses1 = torch.zeros_like(W1)
+        # Extract corresponding block of inverse Hessian
+        Hinv1 = Hinv[i1:i2, i1:i2]
 
-        # Extract inverse Hessian block
-        Hinv1 = Hinv[i1:i2, i1:i2]  # [blocksize, blocksize]
+        # === Determine which weights to prune ===
+        if mask is not None:
+            # Use pre-computed global mask
+            mask1 = mask[:, i1:i2]
+        else:
+            # Compute pruning scores: w^2 / H_ii^2
+            # Higher score = more important weight (keep it)
+            # Lower score = less important (prune it)
+            tmp = W1**2 / (torch.diag(Hinv1).reshape((1, -1))) ** 2
+            # Find threshold for target sparsity
+            thresh = torch.sort(tmp.flatten())[0][int(tmp.numel() * (1.0 - density))]
+            # Mask: True = prune, False = keep
+            mask1 = tmp <= thresh
 
-        # Extract mask block
-        mask1 = mask[:, i1:i2]  # [rows, blocksize]
-
-        # === Process each column in block ===
+        # === Process each column in this block ===
         for i in range(count):
-            w = W1[:, i]  # Current column [rows]
-            d = Hinv1[i, i]  # Diagonal element of Hinv (Cholesky factor)
+            w = W1[:, i]  # Current column of weights [rows]
+            d = Hinv1[i, i]  # Diagonal element of inverse Hessian
 
-            # Apply mask to get pruned weights
+            # Clone weights
             q = w.clone()
-            keep = mask1[:, i] > 0
-            q[~keep] = 0  # Zero out pruned weights
+            # Apply pruning mask: zero out pruned weights
+            q[mask1[:, i]] = 0
 
-            # Store pruned weights
+            # Store pruned/quantized weights
             Q1[:, i] = q
+            # Track squared error (normalized by Hessian)
+            Losses1[:, i] = (w - q) ** 2 / d**2
 
-            # Track reconstruction error (matches reference implementation structure)
-            Losses1[:, i] = (w - q) ** 2 / (d**2 + 1e-10)
-
-            # === ERROR CORRECTION (key innovation!) ===
-            # Compute scaled error using CHOLESKY diagonal (not H^(-1) diagonal)
-            # This matches the original algorithm's structure
-            err1 = (w - q) / (d + 1e-10)  # Scale by Cholesky factor diagonal
-
-            # CRITICAL: Propagate to CURRENT and remaining columns (not just i+1)
-            # This is the key difference from the buggy version
-            # Update W1[:, i:] (from current column onwards)
+            # === Error compensation (key innovation!) ===
+            # Compute error from pruning/quantizing this column
+            err1 = (w - q) / d
+            # Propagate error to remaining columns in this block
+            # This adjusts future columns to compensate for current column's error
             W1[:, i:] -= err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0))
-
-            # Store error for global propagation
+            # Store error for global propagation later
             Err1[:, i] = err1
 
-        # Write pruned block back
+        # Write pruned block back to weight matrix
         W[:, i1:i2] = Q1
-
-        # Accumulate losses
+        # Accumulate losses (factor of 1/2 from quadratic form)
         Losses += torch.sum(Losses1, 1) / 2
 
-        # === GLOBAL error propagation to future blocks ===
-        # Propagate accumulated errors from this block to all future blocks
-        if i2 < columns:
-            W[:, i2:] -= Err1.matmul(Hinv[i1:i2, i2:])
+        # === Global error propagation ===
+        # Propagate errors from this block to all future blocks
+        # This is the key to maintaining model quality despite aggressive pruning
+        W[:, i2:] -= Err1.matmul(Hinv[i1:i2, i2:])
 
         # Validate no NaN/Inf after each block
         if torch.isnan(W).any() or torch.isinf(W).any():
