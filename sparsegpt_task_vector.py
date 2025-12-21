@@ -155,6 +155,10 @@ class SparseGPTTaskVector:
                 f"Task vector shape {task_vector.shape} doesn't match layer shape ({self.rows}, {self.columns})"
             )
 
+        # Store original dtype and device for return
+        original_dtype = task_vector.dtype
+        original_device = task_vector.device
+
         # Work in float32 for numerical precision (matching sparsegpt.py)
         W = task_vector.clone().float().to(self.device)
 
@@ -246,15 +250,35 @@ class SparseGPTTaskVector:
 
         # Print timing and error (matching sparsegpt.py output)
         torch.cuda.synchronize() if torch.cuda.is_available() else None
+
+        # Compute statistics for diagnostics
+        total_params = task_vector.numel()
+        pruned_params = (W == 0).sum().item()
+        actual_sparsity = pruned_params / total_params
+        reconstruction_error = torch.sum(Losses).item()
+
         print(f"  Pruning time: {time.time() - tick:.2f}s")
-        print(f"  Reconstruction error: {torch.sum(Losses).item():.4f}")
+        print(f"  Reconstruction error: {reconstruction_error:.4f}")
+
+        # Diagnostic info for zero reconstruction error
+        if reconstruction_error < 1e-6:
+            task_vector_norm = task_vector.norm().item()
+            task_vector_sparsity = (task_vector.abs() < 1e-6).float().mean().item()
+            print(
+                f"    → Task vector norm: {task_vector_norm:.4f} (small = layer barely changed)"
+            )
+            print(
+                f"    → Task vector sparsity: {task_vector_sparsity:.1%} (high = already sparse)"
+            )
+            if task_vector_norm < 0.01:
+                print(f"    → This layer barely changed during fine-tuning (expected)")
 
         # Optional rescaling (DARE-style)
         if rescale and density > 0:
             W /= density
 
-        # Return in original dtype
-        return W.to(task_vector.dtype)
+        # Return in original dtype and device
+        return W.to(dtype=original_dtype, device=original_device)
 
     def free(self):
         """Free memory used by Hessian (matches sparsegpt.py)."""
