@@ -62,6 +62,18 @@ def llama_ties_merge(
 
     dev = torch.device(device)
 
+    # Validate model compatibility
+    print("\nValidating model architecture...")
+    base_layer_count = len(list(base_model.model.layers))
+    for idx, ft_model in enumerate(finetuned_models):
+        ft_layer_count = len(list(ft_model.model.layers))
+        if ft_layer_count != base_layer_count:
+            raise ValueError(
+                f"Fine-tuned model {idx} has {ft_layer_count} layers, "
+                f"but base model has {base_layer_count} layers."
+            )
+    print(f"  ✓ All models have {base_layer_count} transformer layers")
+
     # Move models to device
     base_model = base_model.to(dev)
     base_model.eval()
@@ -92,22 +104,20 @@ def llama_ties_merge(
         if not ft_weights_list:
             continue  # Skip if layer not found in fine-tuned models
 
-        # Stack into list for TIES
-        ft_weights_list_device = [w.to(dev) for w in ft_weights_list]
-
+        # Models already on device, no need to move weights again
         # Apply TIES merging
         ties_merger = TIES()
         merged_weights = ties_merger.merge(
             weights=[1.0] * len(ft_weights_list),  # Equal weights for all models
-            base_model_parameters=base_weights.to(dev),
-            ft_models_parameters=ft_weights_list_device,
+            base_model_parameters=base_weights,  # Already on dev
+            ft_models_parameters=ft_weights_list,  # Already on dev
             densities=[density] * len(ft_weights_list),  # Same density for all
             device=dev,
             use_sparsegpt=False,  # Magnitude-based
         )
 
-        # Update base model
-        base_layer.weight.data = merged_weights.to(base_weights.device)
+        # Update base model (merged_weights already on dev, same as base)
+        base_layer.weight.data = merged_weights
 
     elapsed = time.time() - start_time
     print(f"\n✓ Merging complete in {elapsed:.1f}s")

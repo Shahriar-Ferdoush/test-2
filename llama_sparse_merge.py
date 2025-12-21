@@ -95,6 +95,19 @@ def llama_sparse_merge_sequential(
 
     dev = torch.device(device)
 
+    # === Step 0: Validate model compatibility ===
+    print("\n[0/3] Validating model architecture compatibility...")
+    base_num_layers = len(base_model.model.layers)
+    for idx, ft_model in enumerate(finetuned_models):
+        ft_num_layers = len(ft_model.model.layers)
+        if ft_num_layers != base_num_layers:
+            raise ValueError(
+                f"Fine-tuned model {idx} has {ft_num_layers} layers, "
+                f"but base model has {base_num_layers} layers. "
+                "Models must have same architecture."
+            )
+    print(f"  ✓ All models have {base_num_layers} transformer layers")
+
     # === Step 1: Disable cache and get model structure ===
     use_cache = base_model.config.use_cache
     base_model.config.use_cache = False
@@ -166,13 +179,11 @@ def llama_sparse_merge_sequential(
     # Pre-allocate storage for layer outputs
     outs = torch.zeros_like(inps)
     attention_mask = cache.get("attention_mask", None)
-    
+
     # Create attention mask if not captured
     if attention_mask is None:
         # Create causal attention mask
-        attention_mask = torch.ones(
-            (nsamples, seqlen), dtype=torch.long, device=dev
-        )
+        attention_mask = torch.ones((nsamples, seqlen), dtype=torch.long, device=dev)
 
     print("\n[3/3] Processing layers sequentially...")
     print("=" * 80)
@@ -214,9 +225,16 @@ def llama_sparse_merge_sequential(
             # Run calibration samples through current base model
             for j in range(nsamples):
                 # Get attention mask slice for this sample
-                attn_mask_slice = attention_mask[j:j+1] if attention_mask is not None else None
+                attn_mask_slice = (
+                    attention_mask[j : j + 1] if attention_mask is not None else None
+                )
                 output = layer(inps[j].unsqueeze(0), attention_mask=attn_mask_slice)
                 # Layer returns tuple (hidden_states, ) or just hidden_states
+                if output is None:
+                    raise RuntimeError(
+                        f"Layer {i} forward pass returned None. "
+                        "This may indicate an issue with the model or attention mask."
+                    )
                 if isinstance(output, tuple):
                     _ = output[0]
                 else:
@@ -227,7 +245,13 @@ def llama_sparse_merge_sequential(
             # === Step 5c: Compute task vectors (fine-tuned - base) ===
             task_vectors = []
             for ft_layer in ft_layers:
-                ft_linear = find_layers(ft_layer)[layer_name]
+                ft_linear_layers = find_layers(ft_layer)
+                if layer_name not in ft_linear_layers:
+                    raise RuntimeError(
+                        f"Layer '{layer_name}' not found in fine-tuned model. "
+                        f"Available layers: {list(ft_linear_layers.keys())}"
+                    )
+                ft_linear = ft_linear_layers[layer_name]
                 task_vector = ft_linear.weight.data - base_linear.weight.data
                 task_vectors.append(task_vector)
 
@@ -258,9 +282,16 @@ def llama_sparse_merge_sequential(
         # === Step 6: Compute outputs from updated layer (inputs for next layer) ===
         for j in range(nsamples):
             # Get attention mask slice for this sample
-            attn_mask_slice = attention_mask[j:j+1] if attention_mask is not None else None
+            attn_mask_slice = (
+                attention_mask[j : j + 1] if attention_mask is not None else None
+            )
             output = layer(inps[j].unsqueeze(0), attention_mask=attn_mask_slice)
             # Layer returns tuple (hidden_states, ) or just hidden_states
+            if output is None:
+                raise RuntimeError(
+                    f"Layer {i} forward pass returned None during output computation. "
+                    "This may indicate an issue with the model or attention mask."
+                )
             if isinstance(output, tuple):
                 outs[j] = output[0]
             else:
