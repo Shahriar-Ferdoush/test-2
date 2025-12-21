@@ -30,6 +30,10 @@ merged_models/
 .cache/
 transformers_cache/
 
+# Markdowns and notebooks
+*.md
+*.ipynb
+
 # Data files
 *.csv
 *.json
