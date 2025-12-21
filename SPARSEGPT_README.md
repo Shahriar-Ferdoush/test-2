@@ -2,21 +2,98 @@
 
 This folder contains a clean, production-ready implementation of SparseGPT-based task vector pruning with error correction for model merging.
 
-## 🎯 What Changed
+## 🎯 Architecture Overview
 
-### Old Implementation (Deprecated)
+### Code Structure (Matching SparseGPT)
 
-- **File**: `sparsegpt_importance_deprecated.py`
-- **Issues**: Mixed old (simple masking) and new (error correction) approaches
-- **API**: Multiple functions with/without error correction causing confusion
+The implementation follows the exact structure of the original SparseGPT codebase:
 
-### New Implementation (Clean)
+**Original SparseGPT** (`sparsegpt/sparsegpt.py`):
 
-- **File**: `sparsegpt_task_vector.py`
-- **Focus**: Only error correction algorithm (blockwise OBS)
-- **API**: Single, clear interface - error correction is the default and only behavior
+```python
+class SparseGPT:
+    def __init__(self, layer): ...
+    def add_batch(self, inp, out): ...  # Accumulate Hessian
+    def fasterprune(self, sparsity, ...): ...  # Prune with error correction
+    def free(self): ...  # Free memory
+```
 
-## 📁 Core Files
+**Our Implementation** (`sparsegpt_task_vector.py`):
+
+```python
+class SparseGPTTaskVector:
+    def __init__(self, layer_shape, device): ...
+    def add_batch(self, inp): ...  # Accumulate Hessian (same as SparseGPT)
+    def fasterprune(self, task_vector, density, ...): ...  # Prune task vector
+    def free(self): ...  # Free memory (same as SparseGPT)
+
+def sequential_layer_pruning(...):  # Like llama_sequential()
+    """Process layers sequentially with accurate input propagation"""
+```
+
+### Key Difference: Weights vs Task Vectors
+
+| **SparseGPT (Original)**      | **SparseGPT Task Vector (Ours)**                                                                     |
+| ----------------------------- | ---------------------------------------------------------------------------------------------------- |
+| Prunes model weights directly | Prunes task vectors (deltas)                                                                         |
+| `W_pruned = prune(W)`         | `task_vector = W_ft - W_base`<br>`tv_pruned = prune(task_vector)`<br>`W_merged = W_base + tv_pruned` |
+| Input: Full weight matrix     | Input: Task vector (delta)                                                                           |
+| Output: Pruned weights        | Output: Pruned task vector                                                                           |
+
+## 🔬 Why Sequential Processing Matters
+
+### The Problem
+
+When pruning task vectors for sequential layers (e.g., layers 0, 1, 2, ...), the pruned task vector from layer `i` affects the inputs to layer `i+1`:
+
+```
+❌ INCORRECT (Parallel Processing):
+  Layer 0: Compute Hessian_0 from base model inputs
+  Layer 1: Compute Hessian_1 from base model inputs  <- WRONG!
+  Layer 2: Compute Hessian_2 from base model inputs  <- WRONG!
+
+  Problem: Layers 1 and 2 see inputs assuming layer 0 is unchanged!
+```
+
+```
+✅ CORRECT (Sequential Processing):
+  Layer 0: Compute Hessian_0 from base model inputs
+          -> Prune task_vector_0
+          -> Add pruned TV to base model
+
+  Layer 1: Compute Hessian_1 from UPDATED model inputs  <- CORRECT!
+          -> Prune task_vector_1
+          -> Add pruned TV to base model
+
+  Layer 2: Compute Hessian_2 from UPDATED model inputs  <- CORRECT!
+```
+
+### Implementation
+
+Our `sequential_layer_pruning()` function follows the exact pattern from `llama_sequential()` in SparseGPT:
+
+```python
+from sparsegpt_task_vector import sequential_layer_pruning
+
+# Process layers sequentially with accurate input propagation
+pruned_tvs = sequential_layer_pruning(
+    base_model=base_model,
+    finetuned_models=[ft_model1, ft_model2],
+    calibration_loader=calibration_data,
+    layer_names=['layer.0.weight', 'layer.1.weight', ...],
+    density=0.2,
+    blocksize=128
+)
+```
+
+The function:
+
+1. Accumulates Hessian for layer `i` from current model state
+2. Prunes task vectors using `SparseGPTTaskVector.fasterprune()`
+3. **Adds pruned task vectors back to base model** (critical step!)
+4. Repeats for layer `i+1` with updated inputs
+
+## 🚀 Quick Start
 
 ### `sparsegpt_task_vector.py` ⭐
 
@@ -60,9 +137,67 @@ Comprehensive comparison script demonstrating:
 pip install torch transformers
 ```
 
-### Basic Usage
+### Usage Option 1: Direct SparseGPTTaskVector Class (Recommended)
 
-#### Option 1: Direct Function Call
+Following the exact SparseGPT pattern:
+
+```python
+from sparsegpt_task_vector import SparseGPTTaskVector
+
+# 1. Initialize pruner for a layer
+layer_shape = (4096, 11008)  # (out_features, in_features)
+pruner = SparseGPTTaskVector(layer_shape, device='cuda')
+
+# 2. Accumulate Hessian from calibration data
+for batch in calibration_data:
+    pruner.add_batch(batch)  # batch: [batch_size, seq_len, in_features]
+
+# 3. Prune task vector with error correction
+task_vector = finetuned_weight - base_weight
+pruned_tv = pruner.fasterprune(
+    task_vector=task_vector,
+    density=0.2,  # Keep 20% of weights
+    blocksize=128,
+    percdamp=0.01,
+    rescale=False
+)
+
+# 4. Apply to base model
+merged_weight = base_weight + pruned_tv
+
+# 5. Free memory
+pruner.free()
+```
+
+### Usage Option 2: Sequential Layer Processing (For Multi-Layer Models)
+
+When you need to prune multiple sequential layers with accurate input propagation:
+
+```python
+from sparsegpt_task_vector import sequential_layer_pruning
+
+# Process all layers sequentially
+pruned_tvs = sequential_layer_pruning(
+    base_model=base_model,
+    finetuned_models=[ft_model1, ft_model2, ft_model3],
+    calibration_loader=calibration_data,
+    layer_names=[
+        'model.layers.0.self_attn.q_proj',
+        'model.layers.0.self_attn.k_proj',
+        'model.layers.0.mlp.gate_proj',
+        # ... more layers
+    ],
+    density=0.2,
+    blocksize=128,
+    percdamp=0.01
+)
+
+# pruned_tvs is a dict: {'layer_name': [tv_model1, tv_model2, tv_model3]}
+```
+
+### Usage Option 3: Legacy API (Backward Compatible)
+
+The old `prune_task_vector_with_error_correction()` function still works:
 
 ```python
 from sparsegpt_task_vector import (

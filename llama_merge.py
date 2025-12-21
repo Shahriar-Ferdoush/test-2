@@ -48,8 +48,10 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, LlamaForCausalLM
 from dare_utils import DARE
 from sparsegpt_task_vector import (
     HessianCalculator,
+    SparseGPTTaskVector,
     compute_importance_scores,
     generate_importance_mask,
+    sequential_layer_pruning,
 )
 from ties_utils import TIES
 
@@ -270,23 +272,25 @@ class LLaMAMerger:
 
     def compute_and_cache_importance_masks(self):
         """
-        STORAGE-OPTIMIZED: Compute importance masks and cache only masks.
+        SEQUENTIAL PROCESSING: Compute importance masks layer-by-layer.
 
-        This saves ~98% storage compared to caching full Hessians:
-        - Old: Save 6GB Hessian per model = 12GB total
-        - New: Save 100MB mask per model = 200MB total
+        Key Innovation: After pruning each layer, we add the pruned task vector
+        back to the base model. This ensures subsequent layers see accurate inputs.
 
         Process:
-        1. Load model
-        2. Compute Hessians (in memory only)
-        3. Generate importance mask from Hessians
-        4. Save ONLY mask (sparse boolean array)
-        5. Delete everything, move to next model
+        1. Load base model
+        2. For each layer sequentially:
+            a. Compute Hessian from current model state
+            b. Prune task vectors using SparseGPTTaskVector
+            c. Update base model with pruned task vectors
+            d. Generate and cache importance masks
+        3. Next layer sees updated inputs (accurate Hessian!)
         """
         log_print("=" * 60)
-        log_print("STEP 2: Computing Importance Masks (SparseGPT)")
+        log_print("STEP 2: Computing Importance Masks (SparseGPT - Sequential)")
         log_print("=" * 60)
-        log_print("Note: Using cached task vectors, computing importance on-the-fly")
+        log_print("Using SEQUENTIAL processing for accurate Hessian computation")
+        log_print("Each layer sees inputs from updated (pruned) previous layers")
 
         # CRITICAL WARNING: Check calibration sample count
         if self.num_calibration_samples < 64:
@@ -352,18 +356,16 @@ class LLaMAMerger:
 
             # Find all linear layers
             linear_layers = self._find_linear_layers(model)
-            log_print(f"  Found {len(linear_layers)} linear layers")
+            layer_names = list(linear_layers.keys())
+            log_print(f"  Found {len(layer_names)} linear layers")
 
-            # Compute Hessians (in memory only, not saved!)
-            log_print(f"  [3/4] Computing Hessians (temporary, in-memory)...")
-            hessian_inv_diags = self._compute_hessians_for_model(
-                model, linear_layers, calibration_data
+            # Load base model for sequential processing
+            log_print(f"  [3/4] Loading base model for sequential processing...")
+            base_model = AutoModelForCausalLM.from_pretrained(
+                self.base_model_path, torch_dtype=torch.float16, device_map=device
             )
-
-            # Generate importance masks from Hessians
-            log_print(
-                f"  [4/4] Generating importance masks (top {int(self.density*100)}% weights)..."
-            )
+            base_model.eval()
+            log_print(f"    ✓ Base model loaded")
 
             # Load pre-computed task vectors from cache
             log_print("    Loading task vectors from cache...")
@@ -376,55 +378,97 @@ class LLaMAMerger:
             task_vector_dict = torch.load(task_vector_file, map_location="cpu")
             log_print(f"    ✓ Loaded {len(task_vector_dict)} task vectors")
 
+            # Sequential processing with SparseGPTTaskVector
+            log_print(
+                f"  [4/4] Processing layers SEQUENTIALLY (top {int(self.density*100)}% weights)..."
+            )
+            log_print(f"    Key: Each layer sees inputs from UPDATED model")
+
             importance_masks = {}
-            for layer_name, h_inv in hessian_inv_diags.items():
-                # Find matching key in task vector cache
+
+            for layer_idx, layer_name in enumerate(layer_names):
+                # Progress logging every 10 layers or first 3
+                if layer_idx % 10 == 0 or layer_idx < 3:
+                    log_print(f"    [{layer_idx+1}/{len(layer_names)}] {layer_name}")
+
+                # Get base layer
+                base_layer = dict(base_model.named_modules())[layer_name]
+                if not isinstance(base_layer, nn.Linear):
+                    continue
+
+                layer_shape = (base_layer.out_features, base_layer.in_features)
+
+                # Create SparseGPTTaskVector pruner
+                pruner = SparseGPTTaskVector(layer_shape, device=device)
+
+                # Register hook to accumulate Hessian
+                def make_hook(pruner_obj):
+                    def hook(module, inp, out):
+                        pruner_obj.add_batch(inp[0].data)
+
+                    return hook
+
+                handle = base_layer.register_forward_hook(make_hook(pruner))
+
+                # Run calibration data to accumulate Hessian
+                with torch.no_grad():
+                    for batch in calibration_data:
+                        batch = batch.to(device)
+                        _ = base_model(batch)
+
+                handle.remove()
+
+                # Find matching task vector
                 layer_key = None
                 for key in task_vector_dict.keys():
                     if layer_name in key or key in layer_name:
                         layer_key = key
                         break
+                if layer_key is None and f"{layer_name}.weight" in task_vector_dict:
+                    layer_key = f"{layer_name}.weight"
 
                 if layer_key is None:
-                    # Try adding .weight suffix
-                    if f"{layer_name}.weight" in task_vector_dict:
-                        layer_key = f"{layer_name}.weight"
-                    else:
-                        log_print(
-                            f"    ⚠ Layer {layer_name} not found in task vectors, skipping"
-                        )
-                        continue
+                    log_print(f"    ⚠ Task vector not found for {layer_name}, skipping")
+                    pruner.free()
+                    continue
 
-                # Get task vector from cache
-                task_vector = task_vector_dict[layer_key]
+                # Get task vector
+                task_vector = task_vector_dict[layer_key].to(device)
 
-                # Calculate importance using FULL Hessian for better quality
-                # Extract diagonal from full inverse Hessian for importance scoring
-                # h_inv is Cholesky factor: H^{-1} = h_inv^T @ h_inv
-                # So diagonal of H^{-1} = sum of squares of rows
-                h_inv_diag = torch.sum(h_inv**2, dim=0)  # [in_features]
-
-                eps = 1e-10  # Numerical stability
-                h_inv_diag_broadcasted = h_inv_diag.unsqueeze(0)  # [1, in_features]
-                importance = task_vector.pow(2) / (
-                    (h_inv_diag_broadcasted + eps).pow(2)
+                # Prune with SparseGPT error correction
+                pruned_tv = pruner.fasterprune(
+                    task_vector=task_vector,
+                    density=self.density,
+                    blocksize=128,
+                    percdamp=0.01,
+                    rescale=False,
                 )
 
-                # Get top-k indices (MUCH more efficient than storing full mask!)
-                k = int(importance.numel() * self.density)
-                flat_importance = importance.flatten()
-                topk_indices = torch.topk(flat_importance, k).indices
+                # CRITICAL: Update base model with pruned task vector
+                # This ensures next layer sees accurate inputs!
+                base_layer.weight.data = base_layer.weight.data + pruned_tv
 
-                # Store ONLY the indices of important weights (not the full mask)
-                # This reduces storage from ~14GB to ~100MB per model!
+                # Extract mask indices from pruned task vector
+                mask = pruned_tv != 0
+                topk_indices = torch.nonzero(mask.flatten(), as_tuple=False).squeeze()
+
+                # Store mask indices
                 importance_masks[layer_name] = {
                     "indices": topk_indices.cpu(),
-                    "shape": importance.shape,
+                    "shape": task_vector.shape,
                     "density": self.density,
                 }
 
+                # Free memory
+                pruner.free()
+                del task_vector, pruned_tv, mask
+                torch.cuda.empty_cache()
+
             log_print(
-                f"  ✓ Generated masks for {len(importance_masks)} layers (with error correction)"
+                f"  ✓ Generated masks for {len(importance_masks)} layers (sequential + error correction)"
+            )
+            log_print(
+                f"    Key benefit: Each layer's Hessian computed from UPDATED model!"
             )
 
             # Save masks ONLY (not Hessians!)
@@ -453,8 +497,8 @@ class LLaMAMerger:
             log_print(f"  Cleaning up memory...")
             del (
                 model,
+                base_model,
                 calibration_data,
-                hessian_inv_diags,
                 importance_masks,
                 task_vector_dict,
             )
@@ -462,7 +506,18 @@ class LLaMAMerger:
             torch.cuda.empty_cache()
             log_print(f"  ✓ Model {idx+1}/{len(self.finetuned_model_paths)} complete!")
 
-        log_print("\n✓ Importance mask computation complete!")
+        log_print("\n" + "=" * 60)
+        log_print("✓ Sequential importance mask computation complete!")
+        log_print("=" * 60)
+        log_print("Key benefits of sequential processing:")
+        log_print("  1. Each layer's Hessian computed from UPDATED model")
+        log_print("  2. More accurate importance scores at high sparsity")
+        log_print("  3. Better model quality retention")
+        log_print(
+            f"\nStorage: ~{len(self.finetuned_model_paths) * 20}MB (indices only)\n"
+            f"  vs ~{len(self.finetuned_model_paths) * 180}MB (dense masks)\n"
+            f"  vs ~{len(self.finetuned_model_paths) * 6000}MB (full Hessians)"
+        )
         log_print(
             f"Storage efficiency: Indices-only format uses ~{len(self.finetuned_model_paths) * 20}MB\n"
             f"  vs ~{len(self.finetuned_model_paths) * 180}MB for dense masks\n"
