@@ -250,8 +250,28 @@ class SparseGPTTaskVector:
 
         # Print timing and error (matching sparsegpt.py output)
         torch.cuda.synchronize() if torch.cuda.is_available() else None
+
+        # Compute statistics for diagnostics
+        total_params = task_vector.numel()
+        pruned_params = (W == 0).sum().item()
+        actual_sparsity = pruned_params / total_params
+        reconstruction_error = torch.sum(Losses).item()
+
         print(f"  Pruning time: {time.time() - tick:.2f}s")
-        print(f"  Reconstruction error: {torch.sum(Losses).item():.4f}")
+        print(f"  Reconstruction error: {reconstruction_error:.4f}")
+
+        # Diagnostic info for zero reconstruction error
+        if reconstruction_error < 1e-6:
+            task_vector_norm = task_vector.norm().item()
+            task_vector_sparsity = (task_vector.abs() < 1e-6).float().mean().item()
+            print(
+                f"    → Task vector norm: {task_vector_norm:.4f} (small = layer barely changed)"
+            )
+            print(
+                f"    → Task vector sparsity: {task_vector_sparsity:.1%} (high = already sparse)"
+            )
+            if task_vector_norm < 0.01:
+                print(f"    → This layer barely changed during fine-tuning (expected)")
 
         # Optional rescaling (DARE-style)
         if rescale and density > 0:

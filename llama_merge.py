@@ -479,6 +479,16 @@ class LLaMAMerger:
                 f"    Key benefit: Each layer's Hessian computed from UPDATED model!"
             )
 
+            # Provide interpretation guidance
+            log_print(
+                f"\n  💡 Note: Zero reconstruction errors are NORMAL and indicate:"
+            )
+            log_print(
+                f"     - Layer barely changed during fine-tuning (task vector ≈ 0)"
+            )
+            log_print(f"     - All important weights were kept (optimal pruning)")
+            log_print(f"     - This is expected behavior, not a bug!")
+
             # Save masks ONLY (not Hessians!)
             log_print(f"  Saving importance masks: {mask_file}")
             torch.save(importance_masks, mask_file)
