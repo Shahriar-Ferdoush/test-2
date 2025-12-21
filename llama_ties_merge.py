@@ -116,6 +116,17 @@ def llama_ties_merge(
             use_sparsegpt=False,  # Magnitude-based
         )
 
+        # Debug: Verify weights actually changed
+        if idx == 0:  # First layer only
+            weight_diff = (merged_weights - base_weights).abs().sum().item()
+            num_changed = ((merged_weights - base_weights).abs() > 1e-6).sum().item()
+            total_params = base_weights.numel()
+            print(f"\n  [DEBUG] TIES first layer:")
+            print(f"    Total abs diff: {weight_diff:.6f}")
+            print(
+                f"    Changed params: {num_changed}/{total_params} ({100*num_changed/total_params:.2f}%)"
+            )
+
         # Update base model (merged_weights already on dev, same as base)
         base_layer.weight.data = merged_weights
 

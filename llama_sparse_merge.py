@@ -324,10 +324,13 @@ def load_calibration_data(
     seq_length: int = 512,
 ) -> List[torch.Tensor]:
     """
-    Load and tokenize calibration data from a dataset.
+    Load and tokenize calibration data from the same dataset used for fine-tuning.
+
+    IMPORTANT: Use the SAME datasets that were used to fine-tune the models!
+    This ensures the Hessian is computed on the correct data distribution.
 
     Args:
-        dataset_name: HuggingFace dataset name
+        dataset_name: HuggingFace dataset name (e.g., "ruslanmv/ai-medical-chatbot")
         tokenizer: Tokenizer for the model
         num_samples: Number of calibration samples
         seq_length: Maximum sequence length
@@ -336,54 +339,110 @@ def load_calibration_data(
         List of tokenized tensors [batch_size=1, seq_len]
     """
     print(f"Loading calibration data from {dataset_name}...")
+    print(f"  ℹ️  Using same dataset as fine-tuning (CRITICAL for accurate Hessian)")
 
     try:
-        if dataset_name == "wikitext":
-            dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
-            text_field = "text"
-        elif dataset_name == "c4":
-            dataset = load_dataset("allenai/c4", "en", split="train", streaming=True)
-            text_field = "text"
-        else:
-            # Try loading as-is
-            dataset = load_dataset(dataset_name, split="train")
-            # Auto-detect text field
-            text_field = None
-            for field in ["text", "content", "prompt", "instruction", "input"]:
-                if field in dataset.column_names:
+        # Load only the first num_samples to avoid downloading entire dataset
+        dataset = load_dataset(dataset_name, split=f"train[:{num_samples}]")
+        print(f"  ✓ Dataset loaded: {len(dataset)} samples")
+
+        # Auto-detect text field (try common field names)
+        text_field = None
+        possible_fields = [
+            "text",  # Standard text field
+            "content",  # Alternative text field
+            "conversation",  # Chat/conversation datasets
+            "messages",  # Chat datasets
+            "prompt",  # Instruction datasets
+            "input",  # Instruction datasets
+            "Patient",  # Medical datasets (ruslanmv/ai-medical-chatbot)
+            "Context",  # Mental health datasets (Amod/mental_health_counseling_conversations)
+        ]
+
+        for field in possible_fields:
+            if field in dataset.column_names:
+                text_field = field
+                print(f"  ✓ Using text field: '{text_field}'")
+                break
+
+        if text_field is None:
+            # Fallback: use first string field
+            for field in dataset.column_names:
+                if isinstance(dataset[0][field], (str, list)):
                     text_field = field
+                    print(f"  ⚠️  Auto-detected text field: '{text_field}'")
                     break
-            if text_field is None:
-                raise ValueError(f"Could not find text field in dataset {dataset_name}")
+
+        if text_field is None:
+            raise ValueError(
+                f"Could not find text field in dataset {dataset_name}. "
+                f"Available columns: {dataset.column_names}"
+            )
 
         # Sample and tokenize
         calibration_data = []
-        for i, example in enumerate(dataset):
-            if i >= num_samples:
+        skipped = 0
+
+        for i in range(len(dataset)):
+            if len(calibration_data) >= num_samples:
                 break
 
-            text = example[text_field]
-            if not text or len(text.strip()) == 0:
+            try:
+                text = dataset[i][text_field]
+
+                # Handle conversation format (list of messages)
+                if isinstance(text, list):
+                    # Join conversation turns
+                    text = " ".join(str(msg) for msg in text if msg)
+
+                # Skip empty texts
+                if not text or len(str(text).strip()) == 0:
+                    skipped += 1
+                    continue
+
+                # Tokenize
+                tokens = tokenizer(
+                    str(text),
+                    return_tensors="pt",
+                    max_length=seq_length,
+                    truncation=True,
+                    padding="max_length",
+                )
+
+                calibration_data.append(tokens.input_ids)
+
+                if (len(calibration_data)) % 20 == 0:
+                    print(
+                        f"    Progress: {len(calibration_data)}/{num_samples} samples tokenized"
+                    )
+
+            except Exception as e:
+                skipped += 1
+                if skipped <= 3:  # Only show first few errors
+                    print(f"    ⚠️  Skipping sample {i}: {e}")
                 continue
 
-            tokens = tokenizer(
-                text,
-                return_tensors="pt",
-                max_length=seq_length,
-                truncation=True,
-                padding="max_length",
-            )
+        if skipped > 0:
+            print(f"  ℹ️  Skipped {skipped} invalid samples")
 
-            calibration_data.append(tokens.input_ids)
+        print(f"  ✓ Loaded {len(calibration_data)} calibration samples")
 
-        print(f"  ✓ Loaded {len(calibration_data)} samples")
+        if len(calibration_data) < num_samples:
+            print(f"  ⚠️  Only got {len(calibration_data)}/{num_samples} samples")
+            print(f"     Hessian quality may be reduced")
+
         return calibration_data
 
     except Exception as e:
         print(f"  ✗ Error loading dataset: {e}")
-        print("  Using dummy calibration data...")
+        print(f"     Dataset: {dataset_name}")
+        print(f"     This usually means:")
+        print(f"       1. Dataset name is incorrect")
+        print(f"       2. Dataset requires authentication")
+        print(f"       3. Network connection issue")
+        print(f"\n  ⚠️  FALLING BACK TO DUMMY DATA (Hessian will be INACCURATE!)")
 
-        # Generate dummy data
+        # Generate dummy data as last resort
         dummy_data = []
         for _ in range(num_samples):
             tokens = torch.randint(0, tokenizer.vocab_size, (1, seq_length))
