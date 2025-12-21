@@ -155,6 +155,10 @@ class SparseGPTTaskVector:
                 f"Task vector shape {task_vector.shape} doesn't match layer shape ({self.rows}, {self.columns})"
             )
 
+        # Store original dtype and device for return
+        original_dtype = task_vector.dtype
+        original_device = task_vector.device
+
         # Work in float32 for numerical precision (matching sparsegpt.py)
         W = task_vector.clone().float().to(self.device)
 
@@ -253,8 +257,8 @@ class SparseGPTTaskVector:
         if rescale and density > 0:
             W /= density
 
-        # Return in original dtype
-        return W.to(task_vector.dtype)
+        # Return in original dtype and device
+        return W.to(dtype=original_dtype, device=original_device)
 
     def free(self):
         """Free memory used by Hessian (matches sparsegpt.py)."""

@@ -362,10 +362,15 @@ class LLaMAMerger:
             # Load base model for sequential processing
             log_print(f"  [3/4] Loading base model for sequential processing...")
             base_model = AutoModelForCausalLM.from_pretrained(
-                self.base_model_path, torch_dtype=torch.float16, device_map=device
+                self.base_model_path,
+                torch_dtype=torch.float16,
+                device_map="auto" if device == "cuda" else "cpu",
             )
             base_model.eval()
-            log_print(f"    ✓ Base model loaded")
+            # Explicitly move to device to ensure consistency
+            if device != "cuda":  # device_map="auto" handles cuda automatically
+                base_model = base_model.to(device)
+            log_print(f"    ✓ Base model loaded on {device}")
 
             # Load pre-computed task vectors from cache
             log_print("    Loading task vectors from cache...")
@@ -432,8 +437,9 @@ class LLaMAMerger:
                     pruner.free()
                     continue
 
-                # Get task vector
+                # Get task vector and ensure it matches base layer dtype
                 task_vector = task_vector_dict[layer_key].to(device)
+                task_vector = task_vector.to(base_layer.weight.dtype)
 
                 # Prune with SparseGPT error correction
                 pruned_tv = pruner.fasterprune(
@@ -446,6 +452,8 @@ class LLaMAMerger:
 
                 # CRITICAL: Update base model with pruned task vector
                 # This ensures next layer sees accurate inputs!
+                # Ensure dtype matches before addition
+                pruned_tv = pruned_tv.to(base_layer.weight.dtype)
                 base_layer.weight.data = base_layer.weight.data + pruned_tv
 
                 # Extract mask indices from pruned task vector
