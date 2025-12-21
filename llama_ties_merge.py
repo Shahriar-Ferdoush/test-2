@@ -92,19 +92,22 @@ def llama_ties_merge(
         if not ft_weights_list:
             continue  # Skip if layer not found in fine-tuned models
 
-        # Stack into tensor [num_models, out_features, in_features]
-        ft_weights = torch.stack(ft_weights_list)
+        # Stack into list for TIES
+        ft_weights_list_device = [w.to(dev) for w in ft_weights_list]
 
         # Apply TIES merging
-        merged_weights = TIES(
-            base_model_parameters=base_weights,
-            ft_models_parameters=ft_weights,
-            density=density,
+        ties_merger = TIES()
+        merged_weights = ties_merger.merge(
+            weights=[1.0] * len(ft_weights_list),  # Equal weights for all models
+            base_model_parameters=base_weights.to(dev),
+            ft_models_parameters=ft_weights_list_device,
+            densities=[density] * len(ft_weights_list),  # Same density for all
             device=dev,
+            use_sparsegpt=False,  # Magnitude-based
         )
 
         # Update base model
-        base_layer.weight.data = merged_weights
+        base_layer.weight.data = merged_weights.to(base_weights.device)
 
     elapsed = time.time() - start_time
     print(f"\n✓ Merging complete in {elapsed:.1f}s")

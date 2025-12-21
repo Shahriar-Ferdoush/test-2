@@ -165,7 +165,14 @@ def llama_sparse_merge_sequential(
 
     # Pre-allocate storage for layer outputs
     outs = torch.zeros_like(inps)
-    attention_mask = cache["attention_mask"]
+    attention_mask = cache.get("attention_mask", None)
+    
+    # Create attention mask if not captured
+    if attention_mask is None:
+        # Create causal attention mask
+        attention_mask = torch.ones(
+            (nsamples, seqlen), dtype=torch.long, device=dev
+        )
 
     print("\n[3/3] Processing layers sequentially...")
     print("=" * 80)
@@ -206,7 +213,14 @@ def llama_sparse_merge_sequential(
 
             # Run calibration samples through current base model
             for j in range(nsamples):
-                _ = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
+                # Get attention mask slice for this sample
+                attn_mask_slice = attention_mask[j:j+1] if attention_mask is not None else None
+                output = layer(inps[j].unsqueeze(0), attention_mask=attn_mask_slice)
+                # Layer returns tuple (hidden_states, ) or just hidden_states
+                if isinstance(output, tuple):
+                    _ = output[0]
+                else:
+                    _ = output
 
             handle.remove()
 
@@ -243,7 +257,14 @@ def llama_sparse_merge_sequential(
 
         # === Step 6: Compute outputs from updated layer (inputs for next layer) ===
         for j in range(nsamples):
-            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
+            # Get attention mask slice for this sample
+            attn_mask_slice = attention_mask[j:j+1] if attention_mask is not None else None
+            output = layer(inps[j].unsqueeze(0), attention_mask=attn_mask_slice)
+            # Layer returns tuple (hidden_states, ) or just hidden_states
+            if isinstance(output, tuple):
+                outs[j] = output[0]
+            else:
+                outs[j] = output
 
         # Move processed layer back to CPU
         layers[i] = layer.cpu()
